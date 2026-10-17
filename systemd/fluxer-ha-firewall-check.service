@@ -1,0 +1,39 @@
+# fluxer-ha: rendered by `fluxer-ha install` (@FLUXER_DIR@, @WG_UNIT@, @RUN_USER@).
+# Runs as @RUN_USER@ with CAP_NET_ADMIN (iptables). Checks the firewall, re-applies it if
+# it's missing or wrong (with an alert), and writes the result to
+# @FLUXER_DIR@/fluxer-ha/state/firewall.status for ha-health.sh, which runs as the
+# Fluxer user.
+[Unit]
+Description=Fluxer HA firewall check
+After=fluxer-ha-firewall.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/fluxer-ha/firewall.sh ensure
+# iptables needs CAP_NET_ADMIN and nothing else (lab: create, change and
+# delete a chain as the Fluxer user with only that capability), so the
+# firewall runs as that user with that one capability, not as root.
+User=@RUN_USER@
+# Sandboxing (docs/security.md, "What runs as root"). The Docker socket is
+# this service's job, so it stays reachable, and with it everything Docker can
+# do; these settings take away the rest: no setuid, no capabilities, no kernel
+# tunables or modules, /usr and /etc read-only, a private /tmp.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0027
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN

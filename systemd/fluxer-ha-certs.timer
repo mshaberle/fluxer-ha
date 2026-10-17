@@ -1,0 +1,10 @@
+# fluxer-ha: rendered by `fluxer-ha install` (@FLUXER_DIR@, @WG_UNIT@).
+[Unit]
+Description=Copy the Fluxer certificate from the primary to the replica every hour
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

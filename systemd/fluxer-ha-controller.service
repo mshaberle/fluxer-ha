@@ -1,0 +1,40 @@
+# fluxer-ha: rendered by `fluxer-ha install` (@FLUXER_DIR@, @WG_UNIT@, @RUN_USER@).
+[Unit]
+Description=Fluxer HA controller (the app tier follows the Patroni primary)
+Requires=docker.service
+After=docker.service @WG_UNIT@ network-online.target fluxer-ha-firewall.service
+Wants=network-online.target fluxer-ha-firewall.service
+
+[Service]
+# The Fluxer user (the one who installed Fluxer, in the docker group); root
+# only when fluxer-ha was installed with --allow-root.
+User=@RUN_USER@
+ExecStart=@FLUXER_DIR@/fluxer-ha/controller.sh
+Restart=always
+RestartSec=2
+
+# Sandboxing (docs/security.md, "What runs as root"). The Docker socket is
+# this service's job, so it stays reachable, and with it everything Docker can
+# do; these settings take away the rest: no setuid, no capabilities, no kernel
+# tunables or modules, /usr and /etc read-only, a private /tmp.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0027
+CapabilityBoundingSet=
+AmbientCapabilities=
+[Install]
+WantedBy=multi-user.target

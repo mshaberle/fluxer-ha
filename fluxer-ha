@@ -1,0 +1,1168 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# fluxer-ha: two-site high availability for a self-hosted Fluxer that runs on
+# Docker Compose. Run `fluxer-ha help`, and read docs/install.md first.
+#
+# Every step that changes something prints what it does, and refuses rather
+# than guesses when the host isn't in the state it expects. Nothing here edits
+# upstream's files: the HA layer is overlays and scripts next to them.
+#
+# Like upstream's install.sh, run it as the account that installed Fluxer (in
+# the docker group), not as root. The few steps that need root (systemd
+# units, the firewall, the watchdog device, the SSH gate's user and sudo rule)
+# go through sudo, and each one is printed with a [root] tag before it runs.
+# `--allow-root` permits running as root instead: then everything, the
+# background services included, runs as root.
+set -eu
+# The same umask as the units (UMask=0027): run by hand from a login shell,
+# Debian's 002 would leave state files group-writable (audit H2).
+umask 027
+
+VERSION=0.1.0
+HERE=$(cd "$(dirname "$0")" && pwd)
+# Installed copy: /usr/local/share/fluxer-ha holds the payload.
+if [ -d "$HERE/lib" ]; then PAYLOAD=$HERE; else PAYLOAD=/usr/local/share/fluxer-ha; fi
+CONF=/etc/fluxer-ha/fluxer-ha.conf
+# Everything of fluxer-ha's that belongs to this instance lives in
+# <Fluxer dir>/fluxer-ha, its state included; set once the directory is known.
+STATE_DIR=
+ALLOW_ROOT=0
+
+say() { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+die() { printf 'fluxer-ha: %s\n' "$*" >&2; exit 1; }
+# Upstream's rule and wording (install.sh, fluxer_preflight).
+preflight() {
+	if [ "$(id -u)" = 0 ] && [ "$ALLOW_ROOT" = 0 ]; then
+		die 'Running as root. Use an account in the docker group, or pass --allow-root.'
+	fi
+	docker info >/dev/null 2>&1 || die "this account ($(id -un)) can't reach Docker: add it to the docker group (then log in again), or pass --allow-root and run as root"
+	RUN_USER=$(id -un)
+	RUN_GROUP=$(id -gn)
+	inst=$(confget RUN_USER)
+	[ -z "$inst" ] || [ "$inst" = "$RUN_USER" ] || die "fluxer-ha was installed for $inst; run it as $inst"
+}
+# Root, through sudo unless we already are root. Printed before it runs.
+asroot() {
+	say "  [root] $*" >&2
+	if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+# Write stdin to a root-owned file.
+asroot_write() {
+	say "  [root] write $1" >&2
+	if [ "$(id -u)" = 0 ]; then install -m "$2" -o root -g root /dev/stdin "$1"; else sudo install -m "$2" -o root -g root /dev/stdin "$1"; fi
+}
+confget() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n 1; }
+envget() { sed -n "s/^$1=//p" "$DIR/.env" 2>/dev/null | tail -n 1; }
+fileget() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1; }
+hex() { openssl rand -hex 32; }
+code() { curl -s -m 2 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true; }
+ip4() { say "$1" | grep -Eqx '([0-9]{1,3}\.){3}[0-9]{1,3}'; }
+
+# The Fluxer directory: --dir, then the installed config, then the current
+# directory. It must be upstream's layout: docker-compose.yml with `name:`.
+DIR=
+resolve_dir() {
+	[ -n "$DIR" ] || DIR=$(confget FLUXER_DIR)
+	[ -n "$DIR" ] || DIR=$(pwd)
+	DIR=$(cd "$DIR" 2>/dev/null && pwd) || die "no such directory: $DIR"
+	STATE_DIR=$DIR/fluxer-ha/state
+	[ -f "$DIR/docker-compose.yml" ] || die "$DIR has no docker-compose.yml. Pass --dir <the directory install.sh created>."
+	cd "$DIR"
+}
+dc() { docker compose --profile app "$@"; }
+pctl() { docker compose exec -T postgres /opt/patroni/bin/patronictl -c /etc/patroni.yml "$@" </dev/null; }
+project() { p=$(envget COMPOSE_PROJECT_NAME); [ -n "$p" ] || p=$(sed -n 's/^name: *//p' docker-compose.yml | head -n 1); say "${p:-fluxer}"; }
+
+usage() {
+	cat <<'EOF'
+Usage: fluxer-ha [--dir <fluxer dir>] [--allow-root] <command> [options]
+
+Run it as the account that installed Fluxer (in the docker group). Steps
+that need root go through sudo and are printed with [root] first.
+--allow-root permits running as root; then the services run as root too.
+
+Set-up, in order (docs/install.md):
+  doctor [site|witness]       check this host; changes nothing
+  init <options>              on site 1: write the HA settings
+  bundle                      on site 1: pack site 2's files (after editing fluxer-ha/.env.shared)
+  install site|witness        put the HA files in place on this host (enables nothing)
+  ssh-link [--peer-key <key>] restricted SSH between the sites; prints this site's key
+  witness-up                  on the witness: start its etcd member
+  etcd-up                     on site 2: start its etcd member (before migrate)
+  migrate                     on site 1: move the running database under Patroni (short window)
+  join                        on site 2: start as the replica
+  leave [--yes] [--replace-old-volume]
+                              back to a single site: the spare, then the site you keep, then the witness
+
+Running it:
+  status                      roles, replication, health, failback
+  switchover [--to <site>]    planned, zero-loss switchover
+  hold | release              stop / allow automatic failback (preferred site)
+  rollout [--dry-run]         apply configuration changes on THIS site (replica only)
+  pin [--pull]                pin every image by digest (optional)
+  upgrade-fetch --ref <ref>|--from <dir> [--tag <tag>]
+                              new upstream stack files on THIS site (run on both)
+  rollback [--files <dir>] [--yes]
+                              undo an upgrade here: files, tag and images, from its records
+  version
+
+Every command and option: docs/commands.md
+EOF
+}
+
+# ----------------------------------------------------------------------------
+cmd_doctor() {
+	role=${1:-$(confget ROLE)}; role=${role:-site}
+	bad=0
+	ok() { say "  ok    $*"; }
+	no() { say "  FAIL  $*"; bad=1; }
+	warn() { say "  warn  $*"; }
+	step "fluxer-ha doctor ($role)"
+	if [ "$(id -u)" = 0 ]; then
+		[ "$ALLOW_ROOT" = 1 ] && warn "running as root (--allow-root): the services will run as root too" || no "running as root: use the account that installed Fluxer, or pass --allow-root"
+	else ok "running as $(id -un)"; fi
+	docker info >/dev/null 2>&1 && ok "Docker reachable as $(id -un)" || no "$(id -un) can't reach Docker (add it to the docker group, then log in again)"
+	if [ "$(id -u)" != 0 ]; then command -v sudo >/dev/null && ok "sudo (install asks for your password for its [root] steps)" || no "sudo missing: install needs it for its [root] steps"; fi
+	for c in docker curl openssl sed awk flock; do command -v $c >/dev/null && ok "$c" || no "$c missing"; done
+	if docker compose version >/dev/null 2>&1; then
+		v=$(docker compose version --short 2>/dev/null | sed 's/^v//')
+		if [ "$(printf '%s\n2.24.4\n' "$v" | sort -V | head -n 1)" = 2.24.4 ]; then ok "Compose $v"; else no "Compose $v; 2.24.4 or newer needed (!reset)"; fi
+	else no "docker compose plugin missing"; fi
+	wg_if=wg0
+	if [ "$role" = site ]; then
+		for c in jq dig chronyc ssh; do command -v $c >/dev/null && ok "$c" || no "$c missing (apt install jq bind9-dnsutils chrony iptables openssh-client sudo)"; done
+		# Site 2 has no Fluxer directory until its bundle is unpacked: check the
+		# host anyway, and the directory only where there is one.
+		[ -n "$DIR" ] || DIR=$(confget FLUXER_DIR)
+		[ -n "$DIR" ] || DIR=$(pwd)
+		if [ -f "$DIR/docker-compose.yml" ]; then
+			resolve_dir; fdir=1
+			ok "Fluxer directory $DIR"
+			# Site 2 has fluxer-ha/.env.shared and fluxer-ha/.env.site from the bundle; join builds .env.
+			envf=.env
+			if [ -f .env ]; then ok ".env present"
+			elif [ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ]; then envf=fluxer-ha/.env.shared; ok "fluxer-ha/.env.shared and fluxer-ha/.env.site present (site 2: join builds .env from them)"
+			else no "no .env in $DIR"; fi
+			[ -n "$(envget FLUXER_HA_WG_INTERFACE)" ] && wg_if=$(envget FLUXER_HA_WG_INTERFACE)
+		else
+			fdir=0
+			warn "no Fluxer directory at $DIR: fine on site 2 before its bundle is unpacked; on site 1, pass --dir <the directory install.sh created>"
+		fi
+		if [ -e /dev/watchdog ]; then
+			o=$(stat -c %u /dev/watchdog)
+			if [ "$o" = 999 ]; then ok "/dev/watchdog owned by uid 999 (postgres in the Patroni image)"
+			elif [ -f "$CONF" ]; then no "/dev/watchdog owned by uid $o; the udev rule from install isn't applied (udevadm trigger --action=add /dev/watchdog)"
+			else warn "/dev/watchdog owned by uid $o; install adds the udev rule"; fi
+		elif [ -f "$CONF" ]; then no "no /dev/watchdog: modprobe softdog, or enable a hardware watchdog"
+		else warn "no /dev/watchdog yet; install loads softdog"; fi
+		# uid 999 is Postgres in the Patroni image, and owns /dev/watchdog. A host
+		# account with that uid gets the watchdog too (S24).
+		w=$(getent passwd 999 | cut -d: -f1)
+		[ -z "$w" ] && ok "no host account has uid 999 (Postgres's uid in the Patroni image)" ||
+			warn "host account '$w' has uid 999, the uid that owns /dev/watchdog: it could reset this host (usermod -u <other> $w; fluxer-ha ssh-link moves its own account)"
+		off=$(chronyc tracking 2>/dev/null | awk '/^System time/ {print $4}')
+		[ -n "$off" ] && awk -v o="$off" 'BEGIN { exit !(o < 0.1) }' && ok "clock offset ${off}s" || no "chrony not synchronised (offset ${off:-unknown})"
+		# Reading iptables needs root; without a cached sudo, ask Docker instead.
+		if { [ "$(id -u)" = 0 ] && iptables -S DOCKER-USER >/dev/null 2>&1; } || sudo -n iptables -S DOCKER-USER >/dev/null 2>&1; then ok "DOCKER-USER chain (iptables backend)"
+		elif docker info --format '{{json .}}' 2>/dev/null | grep -q '"FirewallBackend":{"Driver":"iptables"'; then ok "Docker's firewall backend is iptables (DOCKER-USER)"
+		else no "Docker doesn't report the iptables firewall backend: fluxer-ha's firewall needs its DOCKER-USER chain"; fi
+		if [ "$fdir" = 1 ]; then
+			[ -r $envf ] && ok "$envf readable by $(id -un)" || no "$envf isn't readable by $(id -un): run fluxer-ha as the account that installed Fluxer"
+			if grep -q '^COMPOSE_FILE=' $envf 2>/dev/null; then
+				cf=$(fileget $envf COMPOSE_FILE)
+				case :$cf: in *:tunnel.compose.yml:* | *:external-object-store.compose.yml:*) no "COMPOSE_FILE uses an overlay fluxer-ha doesn't support ($cf)" ;; *) ok "COMPOSE_FILE $cf" ;; esac
+			fi
+			kvurl=$(fileget $envf FLUXER_KV_URL)
+			case $kvurl in '' | *@valkey:6379*) ok "Valkey is the bundled one" ;; *) no "FLUXER_KV_URL points outside the stack; fluxer-ha replicates the bundled Valkey only" ;; esac
+			[ -z "$(fileget $envf FLUXER_POSTGRES_URL)" ] || no "FLUXER_POSTGRES_URL is set: fluxer-ha manages the bundled Postgres only"
+		fi
+	fi
+	if ip link show "$wg_if" >/dev/null 2>&1; then ok "WireGuard interface $wg_if"; else no "no WireGuard interface $wg_if (docs/install.md, 'WireGuard')"; fi
+	if [ -f "$CONF" ]; then ok "installed ($(confget ROLE), $(confget FLUXER_DIR))"; else warn "not installed yet (fluxer-ha install)"; fi
+	[ "$bad" = 0 ] && say "doctor: all checks passed" || { say "doctor: fix the FAIL lines first"; return 1; }
+}
+
+# ----------------------------------------------------------------------------
+# init: on site 1, next to the running instance. Writes nothing the running
+# stack reads: .env stays as it is until `migrate`.
+cmd_init() {
+	preflight; resolve_dir
+	s1wg= s2wg= wwg= s1ip= s2ip= wg_if=wg0 dns=none cert= domain= proxynet=
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--site1-wg) s1wg=$2; shift ;; --site2-wg) s2wg=$2; shift ;; --witness-wg) wwg=$2; shift ;;
+			--site1-ip) s1ip=$2; shift ;; --site2-ip) s2ip=$2; shift ;; --wg-interface) wg_if=$2; shift ;;
+			--dns) dns=$2; shift ;; --cert) cert=$2; shift ;; --domain) domain=$2; shift ;;
+			--proxy-network) proxynet=$2; shift ;;
+			*) die "init: unknown option $1" ;;
+		esac
+		shift
+	done
+	for v in "$s1wg" "$s2wg" "$wwg" "$s1ip" "$s2ip"; do ip4 "$v" || die "init needs --site1-wg --site2-wg --witness-wg --site1-ip --site2-ip (IPv4 addresses)"; done
+	case $dns in cloudflare | exec | none) ;; *) die "--dns takes cloudflare, exec or none" ;; esac
+	[ -f .env ] || die "no .env in $DIR"
+	[ ! -e fluxer-ha/.env.shared ] || die "fluxer-ha/.env.shared already exists; init runs once"
+	mkdir -p fluxer-ha && chmod 755 fluxer-ha
+	cmd_doctor site >/dev/null || say "(doctor reports problems; run 'fluxer-ha doctor' to see them)"
+
+	cf=$(envget COMPOSE_FILE); cf=${cf:-docker-compose.yml}
+	case :$cf: in
+		*:docker-compose.proxy.yml:*) mode=proxy; cert=${cert:-caddy} ;;
+		*) mode=bundled; cert=${cert:-edge} ;;
+	esac
+	case $cert in edge | caddy | none) ;; *) die "--cert takes edge, caddy or none" ;; esac
+	[ "$mode" = proxy ] || [ "$cert" != caddy ] || die "--cert caddy needs your own proxy (docker-compose.proxy.yml in COMPOSE_FILE)"
+	newcf="docker-compose.yml"
+	[ "$mode" = bundled ] || newcf="$newcf:docker-compose.proxy.yml"
+	# Your own overlays stay, after upstream's files and before fluxer-ha's,
+	# and the bundle copies them to site 2. They must sit in this directory.
+	extra=$(printf '%s\n' "$cf" | tr ':' '\n' | grep -vxE 'docker-compose\.yml|docker-compose\.proxy\.yml|(fluxer-ha/)?ha\.(compose|proxy-network|images\.lock)\.yml|' || true)
+	for o in $extra; do
+		case $o in /* | */*) die "COMPOSE_FILE names $o, outside $DIR: the bundle copies your overlays to site 2 by name, so move it into $DIR and name it there" ;; esac
+		[ -f "$o" ] || die "COMPOSE_FILE names $o, which isn't in $DIR"
+		[ -z "$proxynet" ] || ! grep -q "$proxynet" "$o" ||
+			say "!! $o names $proxynet too, and --proxy-network puts the edge on it as well: keep one of them (take $o out of COMPOSE_FILE in fluxer-ha/.env.site on both sites, or run init without --proxy-network)"
+		newcf="$newcf:$o"
+	done
+	[ -z "$proxynet" ] || newcf="$newcf:fluxer-ha/ha.proxy-network.yml"
+	newcf="$newcf:fluxer-ha/ha.compose.yml"
+	domain=${domain:-$(envget FLUXER_DOMAIN)}
+	[ -n "$domain" ] || die "no FLUXER_DOMAIN in .env; pass --domain"
+	[ -z "$(envget FLUXER_KV_URL)" ] || die "FLUXER_KV_URL is set in .env; fluxer-ha replicates the bundled Valkey only"
+
+	umask 077
+	out=$DIR/fluxer-ha/init
+	mkdir -p "$out"
+	step "writing fluxer-ha/.env.shared (your current .env minus the per-site keys, plus the HA settings)"
+	grep -vE '^(COMPOSE_FILE|COMPOSE_PROFILES|FLUXER_LIVEKIT_NODE_IP)=' .env >fluxer-ha/.env.shared
+	cat >>fluxer-ha/.env.shared <<EOF
+
+# --- fluxer-ha $VERSION, written by fluxer-ha init on $(date -u +%FT%TZ) ---
+FLUXER_HA_ETCD_HOSTS=$s1wg:2379,$s2wg:2379,$wwg:2379
+FLUXER_HA_ETCD_INITIAL_CLUSTER=site1=http://$s1wg:2380,site2=http://$s2wg:2380,witness=http://$wwg:2380
+FLUXER_HA_WITNESS_WG_IP=$wwg
+FLUXER_HA_WG_INTERFACE=$wg_if
+FLUXER_HA_FIREWALL_ALLOW=
+FLUXER_HA_PG_HBA_EXTRA=
+FLUXER_HA_PG_SUPERUSER_PASSWORD=$(hex)
+FLUXER_HA_PG_REPLICATION_PASSWORD=$(hex)
+FLUXER_HA_PATRONI_API_PASSWORD=$(hex)
+FLUXER_HA_ETCD_ROOT_PASSWORD=$(hex)
+FLUXER_HA_ETCD_PATRONI_PASSWORD=$(hex)
+FLUXER_HA_VALKEY_PASSWORD=$(hex)
+FLUXER_KV_URL=redis://:\${FLUXER_HA_VALKEY_PASSWORD}@valkey:6379/0
+FLUXER_HA_DNS_NAME=$domain
+FLUXER_HA_DNS_TTL=60
+FLUXER_HA_DNS_PROVIDER=$dns
+FLUXER_HA_DNS_CHECK_RESOLVER=1.1.1.1
+FLUXER_HA_CF_API_TOKEN=
+FLUXER_HA_CF_ZONE_ID=
+FLUXER_HA_CF_RECORD_ID_A=
+FLUXER_HA_CF_RECORD_ID_AAAA=
+FLUXER_HA_DNS_HOOK=
+FLUXER_HA_CERT_MODE=$cert
+FLUXER_HA_CADDY_DATA_VOLUME=
+FLUXER_HA_CADDY_CONTAINER=
+FLUXER_HA_PROXY_NETWORK=$proxynet
+FLUXER_HA_HEARTBEAT_URL=
+FLUXER_HA_ALERT_URL=
+FLUXER_HA_PREFERRED_SITE=site1
+FLUXER_HA_FAILBACK_ENABLED=true
+FLUXER_HA_FAILBACK_STABLE_SECONDS=3600
+FLUXER_HA_FAILBACK_HOURS=
+EOF
+	chmod 600 fluxer-ha/.env.shared
+	for n in 1 2; do
+		if [ $n = 1 ]; then me=$s1wg peer=$s2wg pub=$s1ip peerpub=$s2ip wid=0 cnt=1 subj=svc.snowflakes; else me=$s2wg peer=$s1wg pub=$s2ip peerpub=$s1ip wid=1 cnt=2 subj=svc.snowflakes.shard.1; fi
+		other=$((3 - n))
+		cat >"$out/site$n.env.site" <<EOF
+# fluxer-ha: fluxer-ha/.env.site for site$n. Never copy it to the other site.
+COMPOSE_FILE=$newcf
+FLUXER_HA_SITE=site$n
+FLUXER_HA_PEER_SITE=site$other
+FLUXER_HA_LOCAL_WG_IP=$me
+FLUXER_HA_PEER_WG_IP=$peer
+FLUXER_HA_PEER_SSH=fluxer-ha@$peer
+FLUXER_HA_PUBLIC_IPV4=$pub
+FLUXER_HA_PUBLIC_IPV6=
+FLUXER_HA_PEER_PUBLIC_IPV4=$peerpub
+FLUXER_LIVEKIT_NODE_IP=$pub
+FLUXER_HA_SNOWFLAKE_WORKER_ID=$wid
+FLUXER_HA_SNOWFLAKE_SHARD_COUNT=$cnt
+FLUXER_HA_SNOWFLAKE_SUBJECT=$subj
+EOF
+	done
+	cp "$out/site1.env.site" fluxer-ha/.env.site
+	chmod 600 fluxer-ha/.env.site
+	cat >"$out/witness.env" <<EOF
+FLUXER_HA_LOCAL_WG_IP=$wwg
+FLUXER_HA_WG_INTERFACE=$wg_if
+FLUXER_HA_SITE_WG_IPS=$s1wg,$s2wg
+FLUXER_HA_ETCD_INITIAL_CLUSTER=site1=http://$s1wg:2380,site2=http://$s2wg:2380,witness=http://$wwg:2380
+EOF
+	chmod 600 "$out"/*
+	say ""
+	say "Done. Mode: $mode TLS, certificates: $cert, DNS: $dns. Your running instance is unchanged."
+	[ -z "$extra" ] || say "Your overlays stay in COMPOSE_FILE, and the bundle takes them to site 2: $(echo $extra)"
+	say "Next:"
+	say "  1. edit $DIR/fluxer-ha/.env.shared: the DNS and monitoring settings (docs/install.md, step 4)"
+	say "  2. fluxer-ha bundle      writes the site 2 bundle from the edited file"
+	say "  3. copy $out/witness.env to the witness"
+	say "  4. fluxer-ha install site   (asks for sudo for its [root] steps)"
+}
+
+# bundle: site 2's stack files, fluxer-ha/.env.shared and its fluxer-ha/.env.site, in one archive.
+# Run it again after any edit to fluxer-ha/.env.shared before site 2 has joined.
+cmd_bundle() {
+	preflight; resolve_dir
+	out=$DIR/fluxer-ha/init
+	[ -f fluxer-ha/.env.shared ] && [ -f "$out/site2.env.site" ] || die "run fluxer-ha init first"
+	umask 077
+	tmp=$(mktemp -d)
+	mkdir "$tmp/fluxer-ha"
+	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example; do [ ! -f "$f" ] || cp -p "$f" "$tmp/"; done
+	# Your own overlays named in COMPOSE_FILE (init kept them).
+	for f in $(fileget "$out/site2.env.site" COMPOSE_FILE | tr ':' '\n' | grep -v '^fluxer-ha/'); do
+		[ -f "$f" ] || die "COMPOSE_FILE names $f, which isn't in $DIR"
+		cp -p "$f" "$tmp/"
+	done
+	for f in fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml; do [ ! -f "$f" ] || cp -p "$f" "$tmp/fluxer-ha/"; done
+	cp "$out/site2.env.site" "$tmp/fluxer-ha/.env.site"
+	tar -C "$tmp" -czf "$out/site2-bundle.tar.gz" .
+	rm -r "$tmp"
+	chmod 600 "$out/site2-bundle.tar.gz"
+	say "$out/site2-bundle.tar.gz: copy it to site 2 (it holds every secret: scp, then delete the copy)"
+	say "fluxer-ha/.env.shared sha256 $(sha256sum fluxer-ha/.env.shared | cut -c1-16) (site 2 must show the same)"
+}
+
+# ----------------------------------------------------------------------------
+render() { sed -e "s#@FLUXER_DIR@#$DIR#g" -e "s#@WG_UNIT@#wg-quick@$1.service#g" -e "s#@RUN_USER@#$RUN_USER#g" "$2"; }
+
+# The state directory, owned by the Fluxer user: state, locks, the SSH key.
+make_state_dir() {
+	# In your own directory now: no root needed.
+	mkdir -p "$STATE_DIR/ssh" && chmod 700 "$STATE_DIR" "$STATE_DIR/ssh"
+	# Versions before 2026-10-16 kept the state in /var/lib/fluxer-ha.
+	if [ -d /var/lib/fluxer-ha ]; then
+		say "  moving the state from /var/lib/fluxer-ha to $STATE_DIR"
+		asroot sh -c "cp -a /var/lib/fluxer-ha/. '$STATE_DIR/' && chown -R '$RUN_USER:$RUN_GROUP' '$STATE_DIR' && rm -rf /var/lib/fluxer-ha"
+	fi
+	# An install from before the --allow-root default kept the SSH key in
+	# /root/.ssh. That version wrote a config without RUN_USER.
+	[ -f "$CONF" ] && [ -z "$(confget RUN_USER)" ] || return 0
+	if [ ! -e "$STATE_DIR/ssh/id_ed25519" ] && asroot test -f /root/.ssh/fluxer-ha_ed25519; then
+		asroot install -o "$RUN_USER" -g "$RUN_GROUP" -m 600 /root/.ssh/fluxer-ha_ed25519 "$STATE_DIR/ssh/id_ed25519"
+		asroot install -o "$RUN_USER" -g "$RUN_GROUP" -m 644 /root/.ssh/fluxer-ha_ed25519.pub "$STATE_DIR/ssh/id_ed25519.pub"
+		asroot sh -c "[ ! -f /root/.ssh/known_hosts ] || install -o '$RUN_USER' -g '$RUN_GROUP' -m 644 /root/.ssh/known_hosts '$STATE_DIR/ssh/known_hosts'"
+		say "  moved the SSH key from /root/.ssh to $STATE_DIR/ssh"
+	fi
+}
+
+# Versions before 2026-10-16 kept fluxer-ha's files at the top of the Fluxer
+# directory: ha/, .env.shared, .env.site, ha-init/, backups/fluxer-ha/, the
+# overlays. Move them into fluxer-ha/ (in the Fluxer directory, run from
+# install site). Sets MOVED_LAYOUT=1 if the services were stopped for it.
+MOVED_LAYOUT=0
+move_layout() {
+	old=0
+	for p in ha .env.shared .env.site .env.pre-ha ha-init backups/fluxer-ha ha-upgrade ha.compose.yml ha.proxy-network.yml ha.images.lock.yml; do [ ! -e "$p" ] || old=1; done
+	[ "$old" = 1 ] || return 0
+	step "moving fluxer-ha's files from the top of $DIR into $DIR/fluxer-ha"
+	# A root-only version (before 2026-10-15) left them root-owned.
+	for p in ha .env.shared .env.site .env.pre-ha ha-init backups/fluxer-ha ha-upgrade ha.compose.yml ha.proxy-network.yml ha.images.lock.yml; do
+		[ ! -e "$p" ] || [ -z "$(find "$p" ! -user "$RUN_USER" 2>/dev/null | head -n 1)" ] || asroot chown -R "$RUN_USER:$RUN_GROUP" "$p"
+	done
+	if systemctl is-active --quiet fluxer-ha-controller.service 2>/dev/null; then
+		asroot systemctl stop fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer
+		MOVED_LAYOUT=1
+	fi
+	mkdir -p fluxer-ha && chmod 755 fluxer-ha
+	for f in .env.shared .env.site .env.pre-ha ha.images.lock.yml; do [ ! -e "$f" ] || mv "$f" "fluxer-ha/$f"; done
+	[ ! -d ha-init ] || mv ha-init fluxer-ha/init
+	[ ! -d ha-upgrade ] || mv ha-upgrade fluxer-ha/upgrade
+	if [ -d backups/fluxer-ha ]; then
+		mkdir -p fluxer-ha/backups && chmod 700 fluxer-ha/backups
+		find backups/fluxer-ha -mindepth 1 -maxdepth 1 -exec mv {} fluxer-ha/backups/ \;
+		rmdir backups/fluxer-ha; rmdir backups 2>/dev/null || true   # upstream's own backups stay
+	fi
+	[ ! -d ha/hooks ] || { mkdir -p fluxer-ha/hooks && cp -a ha/hooks/. fluxer-ha/hooks/; }
+	[ ! -f ha/.env.built ] || mv ha/.env.built fluxer-ha/.env.built
+	rm -rf ha
+	rm -f ha.compose.yml ha.proxy-network.yml
+	# COMPOSE_FILE names the overlays by path. init puts it in .env.site
+	# (it differs per site only if you made it so); look in both.
+	for o in ha.proxy-network.yml ha.compose.yml ha.images.lock.yml; do
+		sed -i "/^COMPOSE_FILE=/s#:$o\(:\|\$\)#:fluxer-ha/$o\1#" fluxer-ha/.env.site fluxer-ha/.env.shared
+	done
+	# A DNS hook kept in ha/hooks moved with it.
+	sed -i "/^FLUXER_HA_DNS_HOOK=/s#/ha/hooks/#/fluxer-ha/hooks/#" fluxer-ha/.env.shared
+	say "  moved; COMPOSE_FILE now: $(cat fluxer-ha/.env.site fluxer-ha/.env.shared | sed -n 's/^COMPOSE_FILE=//p' | head -n 1)"
+}
+
+cmd_install() {
+	preflight
+	role=${1:-}
+	case $role in site | witness) ;; *) die "install site|witness" ;; esac
+	step "the fluxer-ha command, root-owned so that nothing you run as root can be edited by an unprivileged account"
+	asroot install -d -m 755 /etc/fluxer-ha /usr/local/share/fluxer-ha /usr/local/lib/fluxer-ha
+	if [ "$PAYLOAD" != /usr/local/share/fluxer-ha ]; then
+		# Replaced, not merged: a file a new version dropped doesn't linger.
+		asroot rm -rf /usr/local/share/fluxer-ha/lib /usr/local/share/fluxer-ha/compose /usr/local/share/fluxer-ha/patroni \
+			/usr/local/share/fluxer-ha/systemd /usr/local/share/fluxer-ha/witness /usr/local/share/fluxer-ha/tests
+		asroot cp -R "$PAYLOAD/lib" "$PAYLOAD/compose" "$PAYLOAD/patroni" "$PAYLOAD/systemd" "$PAYLOAD/witness" "$PAYLOAD/tests" /usr/local/share/fluxer-ha/
+		asroot install -m 755 "$PAYLOAD/fluxer-ha" /usr/local/share/fluxer-ha/fluxer-ha
+		# Readable by everyone, writable by root only. The umask above (027)
+		# made it 750: the installing user couldn't read the drills, and the
+		# command on the PATH couldn't read its own files (lab, ninth run).
+		# Nothing here is secret: it's this repository.
+		asroot chmod -R u=rwX,go=rX /usr/local/share/fluxer-ha
+	fi
+	asroot ln -sf /usr/local/share/fluxer-ha/fluxer-ha /usr/local/bin/fluxer-ha
+	asroot rm -f /usr/local/sbin/fluxer-ha   # from earlier versions
+	if [ "$role" = witness ]; then
+		DIR=${DIR:-$(confget FLUXER_DIR)}; DIR=${DIR:-$HOME/fluxer-witness}
+		[ ! -d "$DIR" ] || [ -w "$DIR" ] || asroot chown -R "$RUN_USER:$RUN_GROUP" "$DIR"   # an earlier root-owned install
+		mkdir -p "$DIR"
+		# The witness's firewall writes its status here.
+		STATE_DIR=$DIR/fluxer-ha/state; make_state_dir
+		install -m 644 "$PAYLOAD/witness/compose.yml" "$DIR/compose.yml"
+		[ -f "$DIR/.env" ] || say "  put the witness.env that init wrote at $DIR/.env (mode 600)"
+		printf 'ROLE=witness\nFLUXER_DIR=%s\nRUN_USER=%s\n' "$DIR" "$RUN_USER" | asroot_write "$CONF" 644
+		# The witness's etcd is published on its WireGuard address, which
+		# a LAN neighbour can reach too: the same firewall as the sites (S14).
+		step "root: the firewall (installed, not enabled; witness-up enables it)"
+		asroot install -m 755 -o root -g root "$PAYLOAD/lib/firewall.sh" /usr/local/lib/fluxer-ha/
+		wg_if=$(fileget "$DIR/.env" FLUXER_HA_WG_INTERFACE); wg_if=${wg_if:-wg0}
+		for u in fluxer-ha-firewall.service fluxer-ha-firewall-check.service fluxer-ha-firewall-check.timer; do
+			render "$wg_if" "$PAYLOAD/systemd/$u" | asroot_write "/etc/systemd/system/$u" 644
+		done
+		asroot systemctl daemon-reload
+		if systemctl is-enabled --quiet fluxer-ha-firewall-check.timer 2>/dev/null; then
+			asroot systemctl restart fluxer-ha-firewall.service
+		fi
+		say "witness files in $DIR. Next: fluxer-ha witness-up"
+		return
+	fi
+	resolve_dir
+	move_layout
+	make_state_dir
+	[ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ] || die "no fluxer-ha/.env.shared / fluxer-ha/.env.site in $DIR (fluxer-ha init on site 1; on site 2, unpack the bundle there)"
+	[ -w . ] && [ -r fluxer-ha/.env.shared ] || die "$(id -un) can't write $DIR or read fluxer-ha/.env.shared: run fluxer-ha as the account that installed Fluxer"
+	wg_if=$(fileget fluxer-ha/.env.shared FLUXER_HA_WG_INTERFACE); wg_if=${wg_if:-wg0}
+	step "HA files and overlays into $DIR/fluxer-ha, owned by $RUN_USER"
+	if [ -d fluxer-ha ] && [ -n "$(find fluxer-ha ! -user "$RUN_USER" 2>/dev/null | head -n 1)" ]; then
+		asroot chown -R "$RUN_USER:$RUN_GROUP" fluxer-ha
+	fi
+	mkdir -p fluxer-ha/dns fluxer-ha/patroni fluxer-ha/tests fluxer-ha/hooks
+	# The services run what's in here: writable by its owner only, whatever
+	# the umask (Debian's is 002 for accounts with a private group).
+	chmod 755 fluxer-ha fluxer-ha/dns fluxer-ha/patroni fluxer-ha/tests fluxer-ha/hooks
+	for f in "$PAYLOAD"/lib/*.sh; do install -m 755 "$f" fluxer-ha/; done
+	chmod 644 fluxer-ha/common.sh fluxer-ha/tiers.sh fluxer-ha/record-images.sh fluxer-ha/valkey-repair.sh
+	for f in "$PAYLOAD"/lib/dns/*.sh; do install -m 644 "$f" fluxer-ha/dns/; done
+	for f in "$PAYLOAD"/patroni/*; do install -m 644 "$f" fluxer-ha/patroni/; done
+	for f in "$PAYLOAD"/tests/*; do install -m 755 "$f" fluxer-ha/tests/; done
+	install -m 644 "$PAYLOAD/compose/ha.compose.yml" "$PAYLOAD/compose/ha.proxy-network.yml" "$DIR/fluxer-ha/"
+	step "root: the SSH gate, the config, systemd units (installed, not enabled), the watchdog"
+	# Root-owned copies of the two scripts that run with privilege, so root
+	# (and the gate's sudo target) never runs a file an account can edit.
+	asroot install -m 755 -o root -g root "$PAYLOAD/lib/ssh-gate.sh" "$PAYLOAD/lib/firewall.sh" /usr/local/lib/fluxer-ha/
+	printf 'ROLE=site\nFLUXER_DIR=%s\nRUN_USER=%s\n' "$DIR" "$RUN_USER" | asroot_write "$CONF" 644
+	for u in "$PAYLOAD"/systemd/fluxer-ha-*; do render "$wg_if" "$u" | asroot_write "/etc/systemd/system/$(basename "$u")" 644; done
+	asroot install -d -m 755 /etc/systemd/system/docker.service.d
+	render "$wg_if" "$PAYLOAD/systemd/docker-after-wireguard.conf" | asroot_write /etc/systemd/system/docker.service.d/fluxer-ha.conf 644
+	asroot systemctl daemon-reload
+	if [ ! -e /dev/watchdog ]; then
+		asroot modprobe softdog || die "no /dev/watchdog and softdog won't load"
+		echo softdog | asroot_write /etc/modules-load.d/fluxer-ha.conf 644
+	fi
+	echo 'KERNEL=="watchdog*", OWNER="999", MODE="0600"' | asroot_write /etc/udev/rules.d/60-fluxer-ha-watchdog.rules 644
+	asroot udevadm control --reload
+	# A subsystem trigger misses /dev/watchdog (subsystem misc): lab F20.
+	asroot udevadm trigger --action=add /dev/watchdog /dev/watchdog0 2>/dev/null || true
+	if systemctl is-enabled --quiet fluxer-ha-controller.service 2>/dev/null; then
+		# Re-installing over a running HA site (an upgrade of fluxer-ha
+		# itself): pick up the new units. Restarting the controller leaves
+		# every container as it is; the timers' next runs use the new files.
+		step "root: this site already runs fluxer-ha; switching its services to the new units"
+		# After a layout move, COMPOSE_FILE names the overlays in fluxer-ha/.
+		[ "$MOVED_LAYOUT" = 0 ] || fluxer-ha/build-env.sh >/dev/null
+		asroot systemctl enable --now fluxer-ha-firewall-check.timer
+		asroot systemctl restart fluxer-ha-controller.service
+		[ "$MOVED_LAYOUT" = 0 ] || asroot systemctl start fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer
+		say ""
+		say "Updated in $DIR; the services now run as $RUN_USER."
+		[ "$MOVED_LAYOUT" = 0 ] || say "The files moved into $DIR/fluxer-ha. Do the same on the other site, then fluxer-ha rollout (the spare, switchover, the other): Patroni's build path changed, so its container counts as reconfigured."
+		# An earlier, root-only version let the gate run as root.
+		if [ -f /etc/sudoers.d/fluxer-ha ] && ! asroot grep -q "^fluxer-ha ALL=($RUN_USER) " /etc/sudoers.d/fluxer-ha; then
+			say "Run fluxer-ha ssh-link once more: its sudo rule still lets the gate run as root rather than as $RUN_USER."
+		fi
+		return
+	fi
+	say ""
+	say "Installed in $DIR; the services will run as $RUN_USER. Nothing is enabled and the running instance is unchanged."
+	say "Next: fluxer-ha ssh-link (on both sites), then migrate (site 1) or etcd-up and join (site 2)."
+}
+
+# ----------------------------------------------------------------------------
+cmd_ssh_link() {
+	preflight; resolve_dir
+	peerkey=
+	[ "${1:-}" != --peer-key ] || peerkey=${2:-}
+	peer=$(envget FLUXER_HA_PEER_WG_IP); [ -n "$peer" ] || peer=$(fileget fluxer-ha/.env.site FLUXER_HA_PEER_WG_IP)
+	ip4 "$peer" || die "no FLUXER_HA_PEER_WG_IP"
+	[ -d "$STATE_DIR/ssh" ] && [ -w "$STATE_DIR/ssh" ] || die "run fluxer-ha install site first"
+	key=$STATE_DIR/ssh/id_ed25519
+	[ -f "$key" ] || ssh-keygen -q -t ed25519 -N '' -C "fluxer-ha@$(hostname)" -f "$key"
+	step "root: the fluxer-ha account and its sudo rule (it may only run the gate, as $RUN_USER)"
+	# Never uid 999: that's Postgres inside the Patroni image, which the udev
+	# rule hands /dev/watchdog to. Debian's first free system uid is often 999,
+	# and the lab's first ssh-link took it, giving this account the watchdog
+	# (S24).
+	free_uid() { u=998; while [ "$u" -gt 100 ]; do getent passwd "$u" >/dev/null || getent group "$u" >/dev/null || { echo "$u"; return; }; u=$((u - 1)); done; }
+	if ! id fluxer-ha >/dev/null 2>&1; then
+		u=$(free_uid); [ -n "$u" ] || die "no free system uid for the fluxer-ha account"
+		asroot groupadd --system --gid "$u" fluxer-ha
+		asroot useradd --system --uid "$u" --gid fluxer-ha --create-home --shell /bin/sh fluxer-ha
+	elif [ "$(id -u fluxer-ha)" = 999 ]; then
+		u=$(free_uid); [ -n "$u" ] || die "no free system uid for the fluxer-ha account"
+		say "  moving the fluxer-ha account off uid 999 (Postgres's uid, which owns /dev/watchdog) to $u"
+		asroot groupmod --gid "$u" fluxer-ha 2>/dev/null || true
+		asroot usermod --uid "$u" --gid "$u" fluxer-ha
+	fi
+	printf '%s\n' "fluxer-ha ALL=($RUN_USER) NOPASSWD: /usr/local/lib/fluxer-ha/ssh-gate.sh env-hash, /usr/local/lib/fluxer-ha/ssh-gate.sh cert-receive" |
+		asroot_write /etc/sudoers.d/fluxer-ha.new 440
+	asroot visudo -cf /etc/sudoers.d/fluxer-ha.new >/dev/null || { asroot rm -f /etc/sudoers.d/fluxer-ha.new; die "sudoers rule didn't validate"; }
+	asroot mv /etc/sudoers.d/fluxer-ha.new /etc/sudoers.d/fluxer-ha
+	if [ -n "$peerkey" ]; then
+		# Exactly one line: grep alone matches line by line, and a second
+		# line would become an authorized key without restrict, from= or
+		# the forced command.
+		[ "$(printf '%s' "$peerkey" | wc -l)" -eq 0 ] && ! printf '%s' "$peerkey" | grep -q "$(printf '\r')" &&
+			say "$peerkey" | grep -Eqx 'ssh-ed25519 [A-Za-z0-9+/]+={0,2}( [A-Za-z0-9@._:+-]{1,100})?' ||
+			die "--peer-key takes the peer's ssh-ed25519 public key: one line, as ssh-link printed it"
+		h=$(getent passwd fluxer-ha | cut -d: -f6)
+		# Root-owned, so even the fluxer-ha account can't change its keys.
+		asroot install -d -o root -g root -m 755 "$h/.ssh"
+		printf 'restrict,from="%s",command="/usr/local/lib/fluxer-ha/ssh-gate.sh" %s\n' "$peer" "$peerkey" | asroot_write "$h/.ssh/authorized_keys" 644
+		# Trust the peer's host key as seen over WireGuard, which authenticates
+		# the peer by its key (trust on first use, inside the tunnel).
+		ssh-keygen -F "$peer" -f "$STATE_DIR/ssh/known_hosts" >/dev/null 2>&1 || ssh-keyscan -t ed25519 "$peer" 2>/dev/null >>"$STATE_DIR/ssh/known_hosts"
+		chmod 644 "$STATE_DIR/ssh/known_hosts"
+		say "peer key installed for $peer"
+	fi
+	say "This site's key; pass it to 'fluxer-ha ssh-link --peer-key' on the other site:"
+	cat "$key.pub"
+}
+
+# ----------------------------------------------------------------------------
+cmd_witness_up() {
+	preflight
+	DIR=${DIR:-$(confget FLUXER_DIR)}; DIR=${DIR:-$HOME/fluxer-witness}
+	cd "$DIR" && [ -f .env ] || die "no $DIR/.env (the witness.env init wrote)"
+	chmod 600 .env
+	docker compose up -d
+	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer
+	say "witness etcd started, reachable from the two sites over WireGuard only. It forms a cluster once one site's etcd is up too."
+}
+
+# ----------------------------------------------------------------------------
+# POSIX sh has no local variables: helpers use their own names (wf_*), so a
+# caller's variables survive the call.
+wait_for() {
+	wf_limit=$1; wf_what=$2; shift 2
+	wf_t0=$(date +%s)
+	until "$@" >/dev/null 2>&1; do
+		[ $(( $(date +%s) - wf_t0 )) -lt "$wf_limit" ] || return 1
+		sleep 2
+	done
+	say "  ok: $wf_what ($(( $(date +%s) - wf_t0 ))s)"
+}
+etcd_healthy_n() {
+	n=0
+	for ep in $(fileget fluxer-ha/.env.shared FLUXER_HA_ETCD_HOSTS | tr ',' ' '); do
+		curl -fsS -m 2 "http://$ep/health" 2>/dev/null | grep -q '"health":"true"' && n=$((n + 1))
+	done
+	[ "$n" -ge "$1" ]
+}
+# The cluster version is 3.0.0 until every member has been seen; 3.4+ is what
+# Patroni needs to use the /v3 API.
+etcd_version_settled() {
+	v=$(curl -fsS -m 2 "http://$(envget FLUXER_HA_LOCAL_WG_IP):2379/version" 2>/dev/null | sed -n 's/.*"etcdcluster":"\([0-9]*\.[0-9]*\).*/\1/p')
+	[ -n "$v" ] && [ "$(printf '%s\n3.4\n' "$v" | sort -V | head -n 1)" = 3.4 ]
+}
+is_primary_local() { [ "$(code http://127.0.0.1:8008/primary)" = 200 ]; }
+is_sync_local() { [ "$(code http://127.0.0.1:8008/sync)" = 200 ]; }
+
+# migrate: on site 1, the running single-site instance becomes the HA primary.
+# The window is the dump and the restore (1 min 48 s in the lab).
+cmd_migrate() {
+	preflight; resolve_dir
+	[ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ] && [ -x fluxer-ha/build-env.sh ] || die "run init and install first"
+	[ "$(fileget fluxer-ha/.env.site FLUXER_HA_SITE)" = site1 ] || die "migrate runs on site 1"
+	[ ! -e "$STATE_DIR/migrated" ] || die "already migrated ($(cat "$STATE_DIR/migrated"))"
+	[ ! -f fluxer-ha/.env.pre-ha ] || die "fluxer-ha/.env.pre-ha exists: a previous migrate didn't finish. Read docs/operations.md, 'Migration rollback'."
+	pgdb=$(envget FLUXER_POSTGRES_DATABASE); pgdb=${pgdb:-fluxer}
+	pguser=$(envget FLUXER_POSTGRES_USERNAME); pguser=${pguser:-fluxer}
+	kv=$(envget FLUXER_POSTGRES_KV_TABLE); kv=${kv:-fluxer_kv}
+	proj=$(project)
+
+	step "preflight"
+	cmd_doctor site || die "doctor failed"
+	witness=$(fileget fluxer-ha/.env.shared FLUXER_HA_WITNESS_WG_IP)
+	# All three etcd members must be running before Patroni first starts. A new
+	# cluster with a member that has never started can't settle its cluster
+	# version and reports 3.0.0; Patroni then uses the v3alpha API, which etcd
+	# 3.5 doesn't serve, and waits forever (lab F34). The peer port's /version
+	# answers even before the cluster has a quorum.
+	for ep in $(fileget fluxer-ha/.env.shared FLUXER_HA_ETCD_INITIAL_CLUSTER | tr ',' '\n' | sed 's#^[^=]*=http://##' | grep -v "^$(fileget fluxer-ha/.env.site FLUXER_HA_LOCAL_WG_IP):"); do
+		curl -fsS -m 3 "http://$ep/version" 2>/dev/null | grep -q etcdserver ||
+			die "etcd at $ep isn't running: 'fluxer-ha witness-up' on the witness and 'fluxer-ha etcd-up' on site 2 first"
+	done
+	docker compose ps --status running --services | grep -qx postgres || die "Postgres isn't running in the current stack"
+	docker volume inspect "${proj}_patroni-data" >/dev/null 2>&1 && die "volume ${proj}_patroni-data already exists"
+	[ -s "$STATE_DIR/ssh/id_ed25519" ] || die "run fluxer-ha ssh-link first"
+
+	step "before the window: build the new env, pull the HA images, build Patroni"
+	umask 077
+	cp -p .env fluxer-ha/.env.pre-ha
+	fluxer-ha/build-env.sh >/dev/null
+	mv .env .env.ha
+	cp -p fluxer-ha/.env.pre-ha .env
+	hacf=$(fileget .env.ha COMPOSE_FILE)
+	COMPOSE_FILE=$hacf docker compose --env-file .env.ha --profile app pull --ignore-buildable --quiet etcd valkey-role-link filer-sync s3-mirror
+	COMPOSE_FILE=$hacf docker compose --env-file .env.ha build postgres
+	# Next to the instance, like upstream's own backups (<dir>/backups).
+	BACKUP_DIR=$DIR/fluxer-ha/backups
+	mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+	dump=$BACKUP_DIR/pre-ha-$(date -u +%Y%m%dT%H%M%SZ).dump
+	before=$(docker compose exec -T postgres psql -U "$pguser" -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null) ||
+		die "can't count the rows of $kv in $pgdb as $pguser; nothing was changed"
+
+	rollback() {
+		say "!! migrate failed: putting the single-site stack back"
+		{ docker compose logs --no-color --tail 200 postgres etcd 2>&1 || true; } >"$BACKUP_DIR/migrate-failure-$(date -u +%Y%m%dT%H%M%SZ).log"
+		say "   the new Postgres and etcd logs are in $BACKUP_DIR/migrate-failure-*.log"
+		# Patroni's half-made cluster: its keys in etcd, then its new volume.
+		# Neither holds anything that isn't in the old volume and the dump.
+		docker compose exec -T etcd etcdctl del --prefix /fluxer/ </dev/null >/dev/null 2>&1 || true
+		# Whatever .env is now, stop the HA containers by label, then restore.
+		for s in postgres etcd valkey-role-link filer-sync s3-mirror; do
+			docker ps -q --filter "label=com.docker.compose.project=$proj" --filter "label=com.docker.compose.service=$s" | xargs -r docker stop >/dev/null
+		done
+		docker ps -aq --filter "label=com.docker.compose.project=$proj" --filter "label=com.docker.compose.service=postgres" | xargs -r docker rm -f >/dev/null
+		docker volume rm "${proj}_patroni-data" >/dev/null 2>&1 || true
+		cp -p fluxer-ha/.env.pre-ha .env
+		docker compose up -d --remove-orphans
+		rm -f fluxer-ha/.env.pre-ha .env.ha
+		die "rolled back to the previous stack; the old database volume was never touched. Dump: $dump"
+	}
+	t0=$(date +%s)
+	step "WINDOW STARTS: stopping everything except Postgres, then dumping"
+	svcs=$(docker compose config --services | grep -vx postgres | tr '\n' ' ')
+	# shellcheck disable=SC2086
+	docker compose stop $svcs
+	docker compose exec -T postgres pg_dump -U "$pguser" -d "$pgdb" -Fc </dev/null >"$dump" || rollback
+	say "  dump: $dump ($(du -h "$dump" | cut -f1)), $before rows in $kv"
+	docker compose stop postgres
+
+	step "switching to the HA configuration; etcd, its users and the firewall"
+	mv .env.ha .env
+	docker compose up -d --no-deps etcd || rollback
+	wait_for 120 "etcd quorum" etcd_healthy_n 2 || rollback
+	# Patroni picks its API from the reported cluster version (F34).
+	wait_for 120 "etcd settled its cluster version" etcd_version_settled || rollback
+	fluxer-ha/etcd-auth.sh users || rollback
+	fluxer-ha/etcd-auth.sh enable || rollback
+	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer || rollback
+
+	step "Patroni: a new cluster in the patroni-data volume"
+	docker compose up -d --no-deps postgres || rollback
+	wait_for 180 "Patroni is the leader" is_primary_local || rollback
+	docker compose exec -T postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+		-v u="$pguser" -v d="$pgdb" -v pw="$(envget POSTGRES_PASSWORD)" >/dev/null <<'SQL' || rollback
+select format('create role %I login password %L', :'u', :'pw') \gexec
+select format('create database %I owner %I', :'d', :'u') \gexec
+SQL
+	docker compose exec -T postgres pg_restore -U postgres -d "$pgdb" --no-owner --role="$pguser" <"$dump" || rollback
+	after=$(docker compose exec -T postgres psql -U postgres -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null 2>/dev/null || echo none)
+	[ "$before" = "$after" ] || { say "!! $kv: $before rows before, $after after"; rollback; }
+	say "  restored: $after rows in $kv"
+
+	step "the rest of the data tier and the warm tier, then the controller (it starts the app tier)"
+	. fluxer-ha/tiers.sh
+	# shellcheck disable=SC2086
+	docker compose up -d --no-deps $(say "$DATA $ONCE" | tr ' ' '\n' | grep -vxE 'etcd|postgres' | tr '\n' ' ') || rollback
+	# The controller only ever starts the warm tier with --no-recreate (it
+	# never applies configuration, F27), so without this the single-site
+	# containers stopped at the start of the window would come back with
+	# their old settings, such as a FLUXER_KV_URL without Valkey's new
+	# password, until the first rollout (lab F39). Site 2 isn't running yet,
+	# so applying the configuration here is safe.
+	# shellcheck disable=SC2086
+	dc up -d --no-deps $WARM || rollback
+	asroot systemctl enable --now fluxer-ha-controller.service
+	dom=$(envget FLUXER_DOMAIN)
+	if wait_for 300 "https://$dom/api/_health answers on this host" curl -fsSk -m 5 -o /dev/null --resolve "$dom:443:127.0.0.1" "https://$dom/api/_health"; then
+		say "WINDOW ENDS after $(( $(date +%s) - t0 ))s"
+	else
+		say "!! the app didn't come up within 5 min. The controller keeps trying: journalctl -u fluxer-ha-controller"
+	fi
+	asroot systemctl enable --now fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer
+	date -u +%FT%TZ >"$STATE_DIR/migrated"
+	say ""
+	say "Site 1 is the HA primary. The old database volume (${proj}_postgres-data), fluxer-ha/.env.pre-ha and $dump"
+	say "are kept for rollback: delete them only after the drills pass (docs/testing.md)."
+	say "Next, on site 2: fluxer-ha join"
+}
+
+# ----------------------------------------------------------------------------
+# leave: back to a single site, keeping every write made since migrate.
+# Order (docs/operations.md, "Leaving HA"): the spare, then the site you keep,
+# then the witness. Each host takes `fluxer-ha leave`.
+#
+# Patroni's data directory is never reused: upstream's Postgres is the Alpine
+# (musl) image and Patroni's the Debian (glibc) one, so text collation differs
+# and copied files could leave text indexes silently wrong. The database goes
+# across as a dump, as it came in at migrate.
+leave_system() {
+	# Everything install put outside the Fluxer directory. Units first.
+	for u in fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer \
+		fluxer-ha-firewall-check.timer fluxer-ha-firewall.service; do
+		systemctl list-unit-files "$u" --no-legend 2>/dev/null | grep -q . && asroot systemctl disable --now "$u" >/dev/null 2>&1
+	done
+	# fluxer-ha-firewall.service's ExecStop removed the rules; make sure.
+	[ ! -x /usr/local/lib/fluxer-ha/firewall.sh ] || asroot /usr/local/lib/fluxer-ha/firewall.sh remove >/dev/null 2>&1 || true
+	asroot sh -c 'rm -f /etc/systemd/system/fluxer-ha-* /etc/systemd/system/docker.service.d/fluxer-ha.conf /etc/udev/rules.d/60-fluxer-ha-watchdog.rules /etc/modules-load.d/fluxer-ha.conf /etc/sudoers.d/fluxer-ha'
+	asroot systemctl daemon-reload
+	id fluxer-ha >/dev/null 2>&1 && asroot userdel -r fluxer-ha 2>/dev/null || true
+	asroot rm -rf /usr/local/lib/fluxer-ha /etc/fluxer-ha
+	rm -rf "$STATE_DIR"
+	say "  removed: the units, the firewall rules, the Docker drop-in, the watchdog rule, the SSH account and its sudo rule, $STATE_DIR"
+	say "  kept: the fluxer-ha command (/usr/local/bin/fluxer-ha; remove /usr/local/share/fluxer-ha and the link when you're done)"
+}
+
+cmd_leave() {
+	preflight
+	yes=0 replace=0
+	for a in "$@"; do case $a in --yes) yes=1 ;; --replace-old-volume) replace=1 ;; *) die "leave: unknown option $a" ;; esac; done
+	role=$(confget ROLE)
+	[ -n "$role" ] || die "fluxer-ha isn't installed on this host (no $CONF)"
+	confirm_leave() {
+		[ "$yes" = 1 ] && return 0
+		printf '%s\nType leave to go on: ' "$1"; read -r ans; [ "$ans" = leave ] || die "not confirmed"
+	}
+	if [ "$role" = witness ]; then
+		DIR=$(confget FLUXER_DIR); STATE_DIR=$DIR/fluxer-ha/state
+		confirm_leave "This stops the witness's etcd member and removes fluxer-ha's system files here."
+		(cd "$DIR" && docker compose down) || die "couldn't stop the witness's etcd"
+		leave_system
+		say "The witness is out. Its etcd volume is kept: docker volume rm fluxer-witness_etcd-data"
+		return
+	fi
+	resolve_dir
+	proj=$(project)
+	pctl_pause() { pctl pause --wait >/dev/null 2>&1 || pctl pause >/dev/null 2>&1; }
+	paused() { pj=$(curl -s -m 3 "http://$1:8008/patroni" 2>/dev/null); say "$pj" | grep -q '"pause": *true'; }
+	if ! is_primary_local; then
+		# The spare goes first: pause Patroni for the whole cluster, so nothing
+		# fails over while the primary leaves, then stop everything here.
+		curl -fsS -m 3 -o /dev/null http://127.0.0.1:8008/replica || die "this site is neither the primary nor a running replica: check fluxer-ha status"
+		confirm_leave "This site is the SPARE. This pauses Patroni for the whole cluster (no failover from now on), then stops this site's stack and removes fluxer-ha here. Volumes are kept."
+		step "pausing Patroni (cluster-wide: no automatic failover from now on)"
+		pctl_pause || die "couldn't pause Patroni"
+		paused 127.0.0.1 || die "Patroni didn't report the pause"
+		step "stopping this site"
+		asroot systemctl disable --now fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer >/dev/null 2>&1 || true
+		dc down || die "docker compose down failed"
+		leave_system
+		say ""
+		say "The spare is out. Next, on the site you keep: fluxer-ha leave"
+		say "Kept here: the volumes (docker volume ls --filter label=com.docker.compose.project=$proj), .env, fluxer-ha/.env.shared, fluxer-ha/.env.site"
+		return
+	fi
+
+	# The site you keep.
+	pgdb=$(envget FLUXER_POSTGRES_DATABASE); pgdb=${pgdb:-fluxer}
+	pguser=$(envget FLUXER_POSTGRES_USERNAME); pguser=${pguser:-fluxer}
+	kv=$(envget FLUXER_POSTGRES_KV_TABLE); kv=${kv:-fluxer_kv}
+	peer=$(envget FLUXER_HA_PEER_WG_IP)
+	step "preflight"
+	if curl -fsS -m 3 -o /dev/null "http://$peer:8008/health" 2>/dev/null; then
+		die "the spare ($peer) is still running Patroni. Run fluxer-ha leave there first, so it can't take over while this site leaves."
+	fi
+	paused 127.0.0.1 || { say "  the spare is gone; pausing Patroni so this site doesn't act on its own"; pctl_pause || die "couldn't pause Patroni"; }
+	if docker volume inspect "${proj}_postgres-data" >/dev/null 2>&1; then
+		[ "$replace" = 1 ] || die "${proj}_postgres-data, the database from BEFORE migrate, still exists. It's stale. Delete it yourself, or pass --replace-old-volume to have leave delete it."
+	fi
+	before=$(docker compose exec -T postgres psql -U postgres -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null) || die "can't count the rows of $kv; nothing was changed"
+	confirm_leave "This site is the PRIMARY. A maintenance window follows: the app stops, the database moves from Patroni to upstream's Postgres (dump and restore), and the single-site stack starts. $before rows in $kv."
+
+	BACKUP_DIR=$DIR/fluxer-ha/backups; mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+	ts=$(date -u +%Y%m%dT%H%M%SZ); dump=$BACKUP_DIR/leave-ha-$ts.dump
+	umask 077
+	cp -p .env "$BACKUP_DIR/.env.ha-$ts"
+	# The single-site .env: this .env minus the HA layer. Every other key stays,
+	# including any install.sh added since.
+	pn=$(envget FLUXER_HA_PROXY_NETWORK)
+	# With --proxy-network, your proxy reaches the edge on its Docker network.
+	# That stays, in upstream's own pattern for it: an overlay of yours next to
+	# the stack that names the network (upstream's reverse-proxy docs, "Docker
+	# labels"). At the top of the Fluxer directory, so deleting fluxer-ha/
+	# afterwards leaves the stack working, and with the network written in, so
+	# no FLUXER_HA_ setting stays behind.
+	pnf=proxy-network.compose.yml
+	if [ -n "$pn" ]; then
+		cat >"$BACKUP_DIR/$pnf.new" <<EOF
+# Written by fluxer-ha leave on $(date -u +%F): puts the Fluxer edge on your
+# reverse proxy's Docker network, $pn, as it was under HA. Yours now; it's
+# named in COMPOSE_FILE in .env. Point the proxy at <project>-edge-1:8080.
+services:
+  edge:
+    networks:
+      - fluxer
+      - proxy
+
+networks:
+  proxy:
+    name: $pn
+    external: true
+EOF
+		[ ! -e "$pnf" ] || grep -q '^# Written by fluxer-ha leave' "$pnf" ||
+			die "$DIR/$pnf exists and isn't fluxer-ha's: move it aside (leave writes your proxy network into a file of that name)"
+	fi
+	cf=$(envget COMPOSE_FILE | tr ':' '\n' | grep -vx 'fluxer-ha/ha.compose.yml' | sed "s#^fluxer-ha/ha.proxy-network.yml\$#$pnf#" | { if [ -n "$pn" ]; then cat; else grep -vx "$pnf"; fi; } | paste -sd: -)
+	{
+		grep -v '^# GENERATED by fluxer-ha/build-env.sh' .env | grep -Ev '^FLUXER_HA_[A-Z0-9_]*=|^COMPOSE_FILE=' |
+			grep -Ev '^FLUXER_KV_URL=.*FLUXER_HA_VALKEY_PASSWORD'
+		echo "COMPOSE_FILE=$cf"
+	} >"$BACKUP_DIR/.env.single-$ts"
+	chmod 600 "$BACKUP_DIR/.env.single-$ts"
+
+	rollback() {
+		say "!! leave failed: putting the HA stack back on this site"
+		docker ps -aq --filter "label=com.docker.compose.project=$proj" --filter "label=com.docker.compose.service=postgres" | xargs -r docker rm -f >/dev/null
+		[ "$replace" = 1 ] || docker volume rm "${proj}_postgres-data" >/dev/null 2>&1 || true
+		cp -p "$BACKUP_DIR/.env.ha-$ts" .env
+		. fluxer-ha/tiers.sh
+		# shellcheck disable=SC2086
+		docker compose up -d --no-deps $DATA
+		wait_for 180 "Patroni is the leader again" is_primary_local || true
+		pctl resume >/dev/null 2>&1 || true
+		asroot systemctl enable --now fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer >/dev/null 2>&1 || true
+		die "rolled back: this site runs HA as before (Patroni resumed). Dump: $dump"
+	}
+	t0=$(date +%s)
+	step "WINDOW STARTS: the HA services and the app stop, then the dump"
+	asroot systemctl disable --now fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer >/dev/null 2>&1 || true
+	# shellcheck disable=SC2046
+	dc stop $(dc config --services | grep -vxE 'postgres|etcd') >/dev/null 2>&1
+	docker compose exec -T postgres pg_dump -U postgres -d "$pgdb" -Fc </dev/null >"$dump" || rollback
+	say "  dump: $dump ($(du -h "$dump" | cut -f1)), $before rows in $kv"
+
+	step "the HA containers out, upstream's Postgres in, the restore"
+	for sv in postgres etcd valkey-role-link filer-sync s3-mirror; do
+		docker ps -aq --filter "label=com.docker.compose.project=$proj" --filter "label=com.docker.compose.service=$sv" | xargs -r docker rm -f >/dev/null
+	done
+	[ "$replace" = 0 ] || docker volume rm "${proj}_postgres-data" >/dev/null || rollback
+	[ -z "$pn" ] || install -m 644 "$BACKUP_DIR/$pnf.new" "$pnf"
+	cp -p "$BACKUP_DIR/.env.single-$ts" .env
+	docker compose up -d --no-deps postgres || rollback
+	# Over TCP: the image's first-start initdb runs a temporary server on the
+	# Unix socket only, then restarts it. A restore started then would be cut off.
+	pg_up() { docker compose exec -T postgres pg_isready -h 127.0.0.1 -U "$pguser" -d "$pgdb" </dev/null; }
+	wait_for 180 "upstream's Postgres accepts connections" pg_up || rollback
+	docker compose exec -T postgres pg_restore -U "$pguser" -d "$pgdb" --no-owner --role="$pguser" <"$dump" || rollback
+	after=$(docker compose exec -T postgres psql -U "$pguser" -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null 2>/dev/null || echo none)
+	[ "$before" = "$after" ] || { say "!! $kv: $before rows before, $after after"; rollback; }
+	say "  restored: $after rows in $kv"
+
+	step "the single-site stack"
+	docker compose up -d --remove-orphans || rollback
+	dom=$(envget FLUXER_DOMAIN)
+	if wait_for 300 "https://$dom/api/_health answers on this host" curl -fsSk -m 5 -o /dev/null --resolve "$dom:443:127.0.0.1" "https://$dom/api/_health"; then
+		say "WINDOW ENDS after $(( $(date +%s) - t0 ))s"
+	else
+		say "!! the stack didn't answer within 5 min: docker compose ps, docker compose logs api"
+	fi
+	step "removing fluxer-ha from this host"
+	leave_system
+	say ""
+	say "This site runs single-site again, with every write made under HA. Kept for rollback, delete when you're sure:"
+	say "  the HA settings:   $DIR/fluxer-ha/ (scripts, .env.shared, .env.site, init/, the overlays, backups/.env.ha-$ts)"
+	say "  the dump:          $dump"
+	[ -z "$pn" ] || say "Keep $DIR/$pnf: COMPOSE_FILE names it, and it puts the edge on $pn for your proxy."
+	say "  the HA volumes:    docker volume rm ${proj}_patroni-data ${proj}_etcd-data ${proj}_s3-mirror-state"
+	say "Then on the witness: fluxer-ha leave"
+}
+
+# ----------------------------------------------------------------------------
+# etcd-up: on site 2, before site 1's migrate. Starts this site's etcd member
+# (and the firewall) so the cluster has all three members from the start.
+cmd_etcd_up() {
+	preflight; resolve_dir
+	[ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ] && [ -x fluxer-ha/build-env.sh ] || die "unpack the site 2 bundle into $DIR and run fluxer-ha install site first"
+	[ "$(fileget fluxer-ha/.env.site FLUXER_HA_SITE)" = site2 ] || die "etcd-up runs on site 2 (site 1's migrate starts its own)"
+	fluxer-ha/build-env.sh >/dev/null
+	docker compose pull --quiet etcd
+	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer
+	docker compose up -d --no-deps etcd
+	say "site 2's etcd member is running. Next, on site 1: fluxer-ha migrate"
+}
+
+# ----------------------------------------------------------------------------
+cmd_join() {
+	preflight; resolve_dir
+	[ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ] && [ -x fluxer-ha/build-env.sh ] || die "unpack the site 2 bundle into $DIR and run fluxer-ha install site first"
+	[ "$(fileget fluxer-ha/.env.site FLUXER_HA_SITE)" = site2 ] || die "join runs on site 2"
+	proj=$(project)
+	for v in postgres-data patroni-data valkey-data seaweedfs-data; do
+		! docker volume inspect "${proj}_$v" >/dev/null 2>&1 || die "volume ${proj}_$v exists: site 2 must start empty (it clones from site 1)"
+	done
+	[ -s "$STATE_DIR/ssh/id_ed25519" ] || die "run fluxer-ha ssh-link first"
+	fluxer-ha/build-env.sh >/dev/null
+	peer=$(envget FLUXER_HA_PEER_WG_IP)
+	[ "$(code "http://$peer:8008/primary")" = 200 ] || die "site 1 ($peer) isn't the Patroni primary yet"
+	step "images"
+	docker compose --profile app pull --ignore-buildable --quiet
+	docker compose build postgres
+	step "etcd and the firewall"
+	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer
+	docker compose up -d --no-deps etcd
+	wait_for 120 "etcd: all 3 members healthy" etcd_healthy_n 3 || die "etcd didn't reach 3 healthy members"
+	step "the data tier; Patroni clones the database from site 1"
+	. fluxer-ha/tiers.sh
+	# shellcheck disable=SC2086
+	docker compose up -d --no-deps $(say "$DATA $ONCE" | tr ' ' '\n' | grep -vx etcd | tr '\n' ' ')
+	wait_for 3600 "this site is the synchronous standby" is_sync_local || die "not the sync standby after an hour: docker compose logs postgres"
+	step "warm tier, and the cold tier created but not started"
+	# shellcheck disable=SC2086
+	docker compose --profile app up -d --no-deps $WARM
+	# shellcheck disable=SC2086
+	docker compose --profile app up --no-start --no-deps $COLD
+	asroot systemctl enable --now fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer
+	say ""
+	say "Site 2 is the replica. Check with: fluxer-ha status"
+}
+
+# ----------------------------------------------------------------------------
+cmd_status() {
+	preflight; resolve_dir
+	step "cluster"
+	pctl list 2>/dev/null | grep -E '^\| ' || say "  Patroni not reachable"
+	step "this site ($(envget FLUXER_HA_SITE))"
+	if is_primary_local; then say "  role: PRIMARY"; elif [ "$(code http://127.0.0.1:8008/replica)" = 200 ]; then say "  role: replica$(is_sync_local && echo ', synchronous standby' || echo ', NOT the sync standby')"; else say "  role: unknown (Patroni down?)"; fi
+	fw=$(cat "$STATE_DIR/firewall.status" 2>/dev/null || echo "no status yet")
+	say "  controller: $(systemctl is-active fluxer-ha-controller 2>/dev/null)   firewall: ${fw%% *} (checked every 30 s)"
+	say "  valkey: $(docker compose exec -T valkey valkey-cli INFO replication </dev/null 2>/dev/null | tr -d '\r' | grep -E '^(role|master_link_status):' | tr '\n' ' ')"
+	for s in filer-sync s3-mirror; do
+		cid=$(docker compose ps -q "$s" 2>/dev/null); say "  $s: $([ -n "$cid" ] && docker inspect -f '{{.State.Health.Status}}' "$cid" || echo 'not running')"
+	done
+	step "etcd"
+	for ep in $(envget FLUXER_HA_ETCD_HOSTS | tr ',' ' '); do say "  $ep $(curl -fsS -m 2 "http://$ep/health" 2>/dev/null || echo unreachable)"; done
+	step "health (as the heartbeat sees it)"
+	if is_primary_local; then say "  the heartbeat runs on the replica; run fluxer-ha status there"
+	else HA_HEALTH_NO_PING=1 ./fluxer-ha/ha-health.sh 2>&1 | tail -n 1 | sed 's/^/  /'; fi
+	step "failback"
+	if [ -e "$STATE_DIR/failback.latched" ]; then
+		[ -s "$STATE_DIR/failback.latched" ] && say "  backing off: $(tr '\n' ' ' <"$STATE_DIR/failback.latched")" || say "  HELD by an operator (fluxer-ha release)"
+	else say "  allowed (preferred site: $(envget FLUXER_HA_PREFERRED_SITE))"; fi
+	[ ! -f "$STATE_DIR/failback.state" ] || say "  state: $(tr '\n' ' ' <"$STATE_DIR/failback.state")"
+}
+
+cmd_switchover() {
+	preflight; resolve_dir
+	to=$(envget FLUXER_HA_PEER_SITE)
+	[ "${1:-}" != --to ] || to=${2:-}
+	leader=$(pctl list 2>/dev/null | awk -F'|' '$4 ~ /Leader/ {gsub(/ /, "", $2); print $2}')
+	[ -n "$leader" ] || die "no Patroni leader"
+	[ "$leader" != "$to" ] || die "$to is already the primary"
+	pctl list | grep -E "^\| $to " | grep -q 'Sync Standby' || die "$to isn't the synchronous standby; a switchover now could lose data or fail"
+	pctl switchover --primary "$leader" --candidate "$to" --force
+	say "Patroni switched over; the controllers move the app tier and DNS. Failback may move it back after the stability window (fluxer-ha hold to stop that)."
+}
+
+cmd_hold() { preflight; resolve_dir; : >"$STATE_DIR/failback.latched"; say "automatic failback held on this site (it only acts on the preferred site)"; }
+cmd_release() { preflight; resolve_dir; rm -f "$STATE_DIR/failback.latched"; say "automatic failback allowed; a fresh stability window starts"; }
+cmd_rollout() { preflight; resolve_dir; exec ./fluxer-ha/rollout.sh "$@"; }
+cmd_pin() { preflight; resolve_dir; exec ./fluxer-ha/pin-images.sh "$@"; }
+
+# ----------------------------------------------------------------------------
+# upgrade-fetch: new upstream stack files on THIS site. Run it the same way on
+# both sites (or run it on one and copy the files). It never restarts
+# anything: `fluxer-ha rollout` on the replica does that.
+cmd_upgrade_fetch() {
+	preflight; resolve_dir
+	ref= tag= from=
+	while [ $# -gt 0 ]; do
+		case $1 in --ref) ref=$2; shift ;; --tag) tag=$2; shift ;; --from) from=$2; shift ;; *) die "upgrade-fetch: unknown option $1" ;; esac
+		shift
+	done
+	[ -n "$ref" ] || [ -n "$from" ] || die "upgrade-fetch needs --ref <git ref> (or --from <dir> with the files)"
+	new=$(mktemp -d)
+	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example; do
+		if [ -n "$from" ]; then cp "$from/$f" "$new/$f"
+		else curl -fsSL --proto '=https' --tlsv1.2 -o "$new/$f" "https://raw.githubusercontent.com/fluxerapp/fluxer/$ref/deploy/self-hosting/$f" || die "download of $f at $ref failed"
+		fi
+		[ -s "$new/$f" ] || die "$f is empty"
+	done
+	grep -q '^services:' "$new/docker-compose.yml" || die "the new docker-compose.yml has no services block"
+	# Patroni runs its own Postgres; a major version change is a separate,
+	# manual procedure (dump and restore) for both upstream and this layer.
+	newmaj=$(sed -n 's/.*FLUXER_POSTGRES_IMAGE:-postgres:\([0-9]*\).*/\1/p' "$new/docker-compose.yml" | head -n 1)
+	patmaj=$(sed -n 's/^FROM postgres:\([0-9]*\).*/\1/p' fluxer-ha/patroni/Dockerfile)
+	[ "$newmaj" = "$patmaj" ] || die "the new release uses Postgres $newmaj and Patroni runs $patmaj: a major upgrade isn't automated (docs/operations.md)"
+	keep=$DIR/fluxer-ha/upgrade/$(date -u +%Y%m%dT%H%M%SZ)
+	mkdir -p "$keep" && chmod 700 "$DIR/fluxer-ha/upgrade" "$keep"
+	# What fluxer-ha rollback puts back: the tag and the image lock as they were.
+	[ ! -f fluxer-ha/ha.images.lock.yml ] || cp -p fluxer-ha/ha.images.lock.yml "$keep/"
+	# And the images this site runs, before the pull moves any tag.
+	. ./fluxer-ha/record-images.sh
+	record_images "$keep"
+	fileget fluxer-ha/.env.shared FLUXER_IMAGE_TAG >"$keep/image-tag"
+	step "changes"
+	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example; do
+		if cmp -s "$f" "$new/$f"; then say "  $f unchanged"; else say "  $f CHANGED"; cp -p "$f" "$keep/" 2>/dev/null || true; install -m 644 "$new/$f" "$f"; fi
+	done
+	rm -r "$new"
+	if [ -n "$tag" ]; then
+		sed -i "s/^FLUXER_IMAGE_TAG=.*/FLUXER_IMAGE_TAG=$tag/" fluxer-ha/.env.shared
+		grep -q '^FLUXER_IMAGE_TAG=' fluxer-ha/.env.shared || printf 'FLUXER_IMAGE_TAG=%s\n' "$tag" >>fluxer-ha/.env.shared
+	fi
+	./fluxer-ha/build-env.sh | tail -n 1
+	docker compose --profile app config -q || say "!! the new files need a setting .env doesn't have: compare .env.example, then edit fluxer-ha/.env.shared on both sites"
+	say ""
+	say "Old files in $keep. Nothing restarted. Next (docs/operations.md, 'Upgrades'):"
+	say "  1. the same on the other site (the fluxer-ha/.env.shared hashes must match)"
+	say "  2. pull on both (with pinning: fluxer-ha pin --pull on one, copy fluxer-ha/ha.images.lock.yml, pull on the other)"
+	say "  3. fluxer-ha rollout on the replica, fluxer-ha switchover, fluxer-ha rollout on the other site"
+	say "To undo before the switchover: fluxer-ha rollback (docs/operations.md, 'Rolling back')."
+}
+
+# ----------------------------------------------------------------------------
+# rollback: undo an upgrade on THIS site, from the records it left:
+#   files and tag  the newest of fluxer-ha/upgrade/<time>/ (upgrade-fetch) and
+#                  ~/fluxer/backups/record-<time>/ (upstream install.sh --update),
+#                  or --files <dir>
+#   images         that record's images (install.sh's), then this site's first
+#                  rollout record made after it (fluxer-ha/upgrade/rollout-*),
+#                  or, if this site hasn't rolled out since, what its
+#                  containers still run
+# It re-tags images and puts files and the tag back; nothing restarts. Then
+# fluxer-ha rollout as for any change. Images pinned by digest come back with
+# the files (the HA overlay, the image lock), so they're left alone here.
+cmd_rollback() {
+	preflight; resolve_dir
+	files= yes=0
+	while [ $# -gt 0 ]; do
+		case $1 in --files) files=$2; shift ;; --yes) yes=1 ;; *) die "rollback: unknown option $1" ;; esac
+		shift
+	done
+	if [ -z "$files" ]; then
+		files=$(ls -1dt fluxer-ha/upgrade/2* backups/record-* 2>/dev/null | head -n 1)
+		[ -n "$files" ] || die "no record to roll back to: neither fluxer-ha upgrade-fetch nor install.sh --update has run here"
+	fi
+	files=$(cd "$files" 2>/dev/null && pwd) || die "no such record: $files"
+	# The first rollout after that record: it wrote down the versions the
+	# upgrade replaced (newest first, so the last match is the earliest).
+	first_rollout=
+	for r in $(ls -1dt fluxer-ha/upgrade/rollout-* 2>/dev/null); do
+		[ "$r" -nt "$files" ] && first_rollout=$r
+	done
+	now=$(mktemp -d); trap 'rm -rf "$now"' EXIT
+	if [ -n "$first_rollout" ]; then imgsrc=$DIR/$first_rollout
+	else . ./fluxer-ha/record-images.sh; record_images "$now"; imgsrc="$now (what this site's containers run now)"
+	fi
+	# The merged list: the files record's own images first (install.sh's),
+	# then the rollout record for every reference it didn't have.
+	{ [ ! -f "$files/images" ] || awk '{print $1, $2, ($3 ? $3 : "-")}' "$files/images"
+	  cat "${imgsrc%% *}/images"; } | awk '!seen[$1]++' >"$now/plan"
+	step "rollback on $(envget FLUXER_HA_SITE)"
+	say "  files and tag from: $files"
+	say "  images from:        ${files}/images (if any), then $imgsrc"
+	tag_old=$(head -n 1 "$files/image-tag" 2>/dev/null || true)
+	tag_now=$(fileget fluxer-ha/.env.shared FLUXER_IMAGE_TAG)
+	[ -z "$tag_old" ] || [ "$tag_old" = "$tag_now" ] || say "  FLUXER_IMAGE_TAG:   $tag_now -> $tag_old (in fluxer-ha/.env.shared)"
+	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example tunnel.compose.yml external-object-store.compose.yml; do
+		[ -s "$files/$f" ] && ! cmp -s "$files/$f" "$f" && say "  file:               $f"
+	done
+	[ ! -f "$files/ha.images.lock.yml" ] || cmp -s "$files/ha.images.lock.yml" fluxer-ha/ha.images.lock.yml || say "  file:               fluxer-ha/ha.images.lock.yml"
+	n=0
+	while read -r ref id dig; do
+		case $ref in *@*) continue ;; esac
+		[ "$id" != - ] || continue
+		cur=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null || echo none)
+		[ "$cur" != "$id" ] || continue
+		say "  image:              $ref -> ${id#sha256:}" | cut -c1-110; n=$((n + 1))
+	done <"$now/plan"
+	[ "$n" -gt 0 ] || [ "$tag_old" != "$tag_now" ] || say "  (no image to move back)"
+	say "Nothing restarts. Afterwards: the same on the other site, then fluxer-ha rollout on the replica,"
+	say "switchover, rollout on the other site. After a switchover onto the NEW version, the database may"
+	say "carry its schema changes: roll back then only if the release notes say that's safe."
+	if [ "$yes" != 1 ]; then printf 'Type rollback to go ahead: '; read -r a; [ "$a" = rollback ] || die "not confirmed"; fi
+	. ./fluxer-ha/record-images.sh
+	while read -r ref id dig; do
+		case $ref in *@*) continue ;; esac
+		[ "$id" != - ] || continue
+		[ "$dig" != - ] || dig=$(image_digest "$ref" "$id")
+		if ! docker image inspect "$id" >/dev/null 2>&1; then
+			[ "$dig" != - ] || { say "!! $ref: image ${id#sha256:} is gone from this host and has no registry digest; it keeps its current image"; continue; }
+			say "  pulling $dig (no longer on this host)"
+			docker pull -q "$dig" >/dev/null || { say "!! $ref: pulling $dig failed; it keeps its current image"; continue; }
+		fi
+		docker image tag "$id" "$ref" || die "re-tagging $ref failed"
+	done <"$now/plan"
+	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example tunnel.compose.yml external-object-store.compose.yml; do
+		[ -s "$files/$f" ] && ! cmp -s "$files/$f" "$f" && install -m 644 "$files/$f" "$f"
+	done
+	[ ! -f "$files/ha.images.lock.yml" ] || install -m 644 "$files/ha.images.lock.yml" fluxer-ha/ha.images.lock.yml
+	if [ -n "$tag_old" ] && [ "$tag_old" != "$tag_now" ]; then
+		sed -i "s/^FLUXER_IMAGE_TAG=.*/FLUXER_IMAGE_TAG=$tag_old/" fluxer-ha/.env.shared
+	fi
+	./fluxer-ha/build-env.sh | tail -n 1
+	docker compose --profile app config -q || die "the restored files don't parse with this .env; compare them with $files"
+	say ""
+	say "Rolled back here; nothing restarted. Next: the same on the other site (the fluxer-ha/.env.shared"
+	say "hashes must match), then fluxer-ha rollout on the replica, switchover, rollout on the other site."
+}
+
+# ----------------------------------------------------------------------------
+# --allow-root may come anywhere, as with upstream's install.sh.
+for a in "$@"; do [ "$a" != --allow-root ] || ALLOW_ROOT=1; done
+if [ "$ALLOW_ROOT" = 1 ]; then
+	n=$#
+	while [ "$n" -gt 0 ]; do a=$1; shift; [ "$a" = --allow-root ] || set -- "$@" "$a"; n=$((n - 1)); done
+fi
+while [ $# -gt 0 ]; do
+	case $1 in
+		--dir) DIR=$2; shift 2 ;;
+		-h | --help | help) usage; exit 0 ;;
+		*) break ;;
+	esac
+done
+cmd=${1:-}; [ $# -eq 0 ] || shift
+case $cmd in
+	doctor) cmd_doctor "$@" ;;
+	init) cmd_init "$@" ;;
+	bundle) cmd_bundle ;;
+	install) cmd_install "$@" ;;
+	ssh-link) cmd_ssh_link "$@" ;;
+	witness-up) cmd_witness_up ;;
+	migrate) cmd_migrate ;;
+	etcd-up) cmd_etcd_up ;;
+	join) cmd_join ;;
+	leave) cmd_leave "$@" ;;
+	status) cmd_status ;;
+	switchover) cmd_switchover "$@" ;;
+	hold) cmd_hold ;;
+	release) cmd_release ;;
+	rollout) cmd_rollout "$@" ;;
+	pin) cmd_pin "$@" ;;
+	upgrade-fetch) cmd_upgrade_fetch "$@" ;;
+	rollback) cmd_rollback "$@" ;;
+	version) say "fluxer-ha $VERSION" ;;
+	'') usage; exit 2 ;;
+	*) usage >&2; die "unknown command: $cmd" ;;
+esac

@@ -1,0 +1,11 @@
+# fluxer-ha: rendered by `fluxer-ha install` (@FLUXER_DIR@, @WG_UNIT@, @RUN_USER@).
+[Unit]
+Description=Fluxer HA firewall check every 30 s
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=30
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target

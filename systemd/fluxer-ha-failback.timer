@@ -1,0 +1,12 @@
+# fluxer-ha: rendered by `fluxer-ha install` (@FLUXER_DIR@, @WG_UNIT@).
+# Installed on BOTH sites; the script only acts on FLUXER_HA_PREFERRED_SITE.
+[Unit]
+Description=Fluxer HA automatic failback check every 60 s
+
+[Timer]
+OnBootSec=120
+OnUnitInactiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

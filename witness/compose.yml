@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# fluxer-ha: see docs/architecture.md.
+# Runs ONE etcd member, the tie-breaking third vote, on a small VM at a third
+# location. Fluxer itself never runs here.
+#
+#   docker compose up -d      (with the settings in .env next to this file)
+#
+# The file is named .env, not witness.env, so every plain `docker compose`
+# command picks it up. With --env-file, a bare `docker compose stop` failed
+# (lab).
+#
+# The image is pinned by digest (docs/security.md S9).
+#
+# The witness is an etcd MEMBER, so it can write anything Patroni reads from
+# etcd, auth or not (docs/security.md, "The witness is inside the trust boundary"). Keep this host small and
+# boring: WireGuard and this one container, SSH by key only, automatic
+# security updates, nothing else listening.
+name: fluxer-witness
+
+# Containers the HA layer adds (docs/security.md S20): no Linux capabilities,
+# no privilege escalation (setuid binaries in the image stay inert), and a
+# read-only root filesystem with a private /tmp. etcd and s3-mirror keep the
+# image's root user, because their volumes are root-owned (without
+# capabilities, root still writes only what it owns); the two loops run as
+# nobody.
+x-hardened: &hardened
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: [/tmp]
+
+services:
+  etcd:
+    <<: *hardened
+    image: ${FLUXER_HA_ETCD_IMAGE:-quay.io/coreos/etcd:v3.6.15@sha256:7cf6622cb09b111289eed8a0cce3478e4f01d5048b0e0a1ed208299f3419334d}
+    restart: unless-stopped
+    command: ["/usr/local/bin/etcd"]
+    environment:
+      ETCD_NAME: witness
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${FLUXER_HA_LOCAL_WG_IP:?}:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://${FLUXER_HA_LOCAL_WG_IP:?}:2379
+      ETCD_INITIAL_CLUSTER: ${FLUXER_HA_ETCD_INITIAL_CLUSTER:?}
+      ETCD_INITIAL_CLUSTER_STATE: ${FLUXER_HA_ETCD_INITIAL_CLUSTER_STATE:-new}
+      ETCD_INITIAL_CLUSTER_TOKEN: fluxer-ha
+    ports:
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:2379:2379"
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:2380:2380"
+    volumes:
+      - etcd-data:/etcd-data
+
+volumes:
+  etcd-data:

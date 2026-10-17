@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# fluxer-ha, optional: for a reverse proxy that runs as a container on its own
+# Docker network (Caddy, nginx, Traefik). Puts the Fluxer edge, and only the
+# edge, on that network, so the proxy can reach it by name. Everything else
+# stays on Fluxer's private network. A proxy on the host uses 127.0.0.1:8080
+# and doesn't need this file.
+#
+#   FLUXER_HA_PROXY_NETWORK=caddy_default    (docker network ls)
+#
+# Point the proxy at the edge's container name, <project>-edge-1:8080
+# (fluxer-edge-1:8080 with upstream's `name: fluxer`). It's kept in its own
+# file because `install.sh --update` replaces docker-compose.proxy.yml.
+services:
+  edge:
+    networks:
+      - fluxer
+      - proxy
+
+networks:
+  proxy:
+    name: ${FLUXER_HA_PROXY_NETWORK:?set FLUXER_HA_PROXY_NETWORK to your reverse proxy's Docker network}
+    external: true

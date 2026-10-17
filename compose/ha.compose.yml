@@ -1,0 +1,346 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# fluxer-ha: the two-site overlay. `fluxer-ha install` copies it next to
+# upstream's docker-compose.yml and adds it to COMPOSE_FILE:
+#
+#   bundled TLS (upstream default):  docker-compose.yml:ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
+#   your own reverse proxy:          docker-compose.yml:docker-compose.proxy.yml[:ha.proxy-network.yml]:ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
+#
+# The same file runs on both sites. Nothing in it says which site is primary:
+# Patroni decides (through etcd, with the witness as the third vote) and
+# everything else follows Patroni:
+#   - fluxer-ha/controller.sh runs the COLD tier, the edge included, on the primary
+#     only, and points public DNS at it (fluxer-ha/dns-failover.sh)
+#   - valkey-role-link points Valkey at the current primary
+#   - filer-sync and s3-mirror copy media from the current primary
+# Security: Patroni's REST API needs a password for anything that changes
+# state; etcd uses RBAC; Valkey needs a password; fluxer-ha/firewall.sh limits what
+# reaches these ports over WireGuard (docs/security.md).
+# Needs Compose 2.24.4 or newer (for !reset), like upstream's own overlays.
+
+x-warm: &warm
+  # Runs on BOTH sites: no database writes at startup, no inbound traffic.
+  # The controller keeps these up.
+  profiles: [app]
+
+x-cold: &cold
+  # Runs on the PRIMARY only. The controller starts and stops these.
+  # restart "no" stops Docker from bringing them back on a host that has
+  # rebooted as a replica.
+  profiles: [app]
+  restart: "no"
+
+# Containers the HA layer adds (docs/security.md S20): no Linux capabilities,
+# no privilege escalation (setuid binaries in the image stay inert), and a
+# read-only root filesystem with a private /tmp. etcd and s3-mirror keep the
+# image's root user, because their volumes are root-owned (without
+# capabilities, root still writes only what it owns); the two loops run as
+# nobody.
+x-hardened: &hardened
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: [/tmp]
+
+services:
+  # --- Application tier ------------------------------------------------------
+  gateway: *warm
+  media-proxy: *warm
+  static-proxy: *warm
+  snowflakes: *warm
+  # Per-site snowflake worker ID (docs/architecture.md, "Snowflake IDs"). Site 1 keeps worker 0, the stock
+  # value. Site 2 runs its shard as shard 1 of 2, which makes its worker ID 1
+  # (fluxer_snowflakes/src/main.rs passes the shard ID as the worker ID), and
+  # its API and worker request IDs from that shard directly
+  # (FLUXER_SNOWFLAKE_SERVICE_SUBJECT, read in ServiceRegistry.ts:42), so the
+  # router's shard count of 1 never sends anything to a missing shard 0.
+  snowflakes-shard:
+    <<: *warm
+    environment:
+      FLUXER_SVC_SHARD_ID: ${FLUXER_HA_SNOWFLAKE_WORKER_ID:-0}
+      FLUXER_SVC_SHARD_COUNT: ${FLUXER_HA_SNOWFLAKE_SHARD_COUNT:-1}
+  gifs: *warm
+  gifs-shard: *warm
+  unfurl: *warm
+  unfurl-shard: *warm
+
+  # The API, worker and the users/messages shards run schema DDL at startup
+  # (PostgresKvQueryExecutor.ts:856-937, fluxer_svc/src/postgres.rs:96), so
+  # they can only start against a primary.
+  api:
+    <<: *cold
+    environment:
+      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
+  worker:
+    <<: *cold
+    environment:
+      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
+  users: *cold
+  users-shard: *cold
+  messages: *cold
+  messages-shard: *cold
+  push: *cold
+  app-proxy: *cold
+  admin: *cold
+  livekit: *cold
+  # The edge: with bundled TLS it binds 80/443 and gets the certificate; behind
+  # your own proxy it serves plain HTTP for it (docker-compose.proxy.yml).
+  # Because it's cold, a non-primary site serves nothing for the Fluxer domain:
+  # nothing listens (bundled), or your proxy has no upstream (it should then
+  # close the connection: docs/reverse-proxies.md). That's the traffic-side
+  # fence. A proxy must forward ONLY to the edge, never straight to gateway or
+  # media-proxy, which run on both sites.
+  edge: *cold
+
+  # --- Postgres under Patroni (both sites) ----------------------------------
+  postgres:
+    # Runs as postgres (the image's USER); it needs no capabilities, and the
+    # watchdog device is handed to uid 999 by the udev rule (S20).
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    build:
+      context: ./fluxer-ha/patroni
+    image: fluxer-patroni:local
+    # Built locally (docker compose build postgres). Without this, `docker
+    # compose pull` tries a registry and errors (lab).
+    pull_policy: never
+    command: !reset null
+    environment:
+      PATRONI_NAME: ${FLUXER_HA_SITE:?set FLUXER_HA_SITE in fluxer-ha/.env.site}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: ${FLUXER_HA_LOCAL_WG_IP:?set FLUXER_HA_LOCAL_WG_IP in fluxer-ha/.env.site}:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: ${FLUXER_HA_LOCAL_WG_IP:?}:5432
+      PATRONI_ETCD3_HOSTS: ${FLUXER_HA_ETCD_HOSTS:?set FLUXER_HA_ETCD_HOSTS in fluxer-ha/.env.shared}
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${FLUXER_HA_PG_SUPERUSER_PASSWORD:?set FLUXER_HA_PG_SUPERUSER_PASSWORD in fluxer-ha/.env.shared}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${FLUXER_HA_PG_REPLICATION_PASSWORD:?set FLUXER_HA_PG_REPLICATION_PASSWORD in fluxer-ha/.env.shared}
+      # Basic auth on the REST API's unsafe methods (docs/security.md S1). Patroni sends it
+      # to the other member itself (failsafe, switchover), and patronictl in
+      # this container picks it up from the environment.
+      PATRONI_RESTAPI_USERNAME: patroni
+      PATRONI_RESTAPI_PASSWORD: ${FLUXER_HA_PATRONI_API_PASSWORD:?set FLUXER_HA_PATRONI_API_PASSWORD in fluxer-ha/.env.shared}
+      # etcd RBAC user, read/write on /fluxer/ only (fluxer-ha/etcd-auth.sh).
+      PATRONI_ETCD3_USERNAME: patroni
+      PATRONI_ETCD3_PASSWORD: ${FLUXER_HA_ETCD_PATRONI_PASSWORD:?set FLUXER_HA_ETCD_PATRONI_PASSWORD in fluxer-ha/.env.shared}
+      # pg_hba gets a /32 for each site and nothing else (entrypoint.py).
+      FLUXER_HA_SITE_WG_IPS: ${FLUXER_HA_LOCAL_WG_IP:?},${FLUXER_HA_PEER_WG_IP:?set FLUXER_HA_PEER_WG_IP in fluxer-ha/.env.site}
+      # Optional extra pg_hba lines (";"-separated). Empty in production.
+      FLUXER_HA_PG_HBA_EXTRA: ${FLUXER_HA_PG_HBA_EXTRA:-}
+    volumes:
+      # Same target path as the base file, so this replaces the old postgres-data
+      # mount. The old volume is kept untouched as a migration rollback (docs/operations.md, "Migration").
+      - patroni-data:/var/lib/postgresql/data
+    devices:
+      - /dev/watchdog:/dev/watchdog
+    ports:
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:5432:5432"
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:8008:8008"
+      - "127.0.0.1:8008:8008"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 120s
+    stop_grace_period: 60s
+    depends_on:
+      etcd: {condition: service_started}
+
+  etcd:
+    <<: *hardened
+    # One of three etcd members. The third runs on the witness (witness/compose.yml).
+    image: ${FLUXER_HA_ETCD_IMAGE:-quay.io/coreos/etcd:v3.6.15@sha256:7cf6622cb09b111289eed8a0cce3478e4f01d5048b0e0a1ed208299f3419334d}
+    restart: unless-stopped
+    networks: [fluxer]
+    command: ["/usr/local/bin/etcd"]
+    environment:
+      # For etcdctl run inside this container (ha-health.sh, the game-day
+      # scripts); etcd itself ignores it. Root, because move-leader needs it.
+      ETCDCTL_USER: root:${FLUXER_HA_ETCD_ROOT_PASSWORD:?set FLUXER_HA_ETCD_ROOT_PASSWORD in fluxer-ha/.env.shared}
+      ETCD_NAME: ${FLUXER_HA_SITE:?}
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${FLUXER_HA_LOCAL_WG_IP:?}:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://${FLUXER_HA_LOCAL_WG_IP:?}:2379
+      ETCD_INITIAL_CLUSTER: ${FLUXER_HA_ETCD_INITIAL_CLUSTER:?set FLUXER_HA_ETCD_INITIAL_CLUSTER in fluxer-ha/.env.shared}
+      ETCD_INITIAL_CLUSTER_STATE: ${FLUXER_HA_ETCD_INITIAL_CLUSTER_STATE:-new}
+      ETCD_INITIAL_CLUSTER_TOKEN: fluxer-ha
+    ports:
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:2379:2379"
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:2380:2380"
+    volumes:
+      - etcd-data:/etcd-data
+
+  # --- Data tier peers over WireGuard (both sites) --------------------------
+  valkey:
+    ports:
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:6379:6379"
+    # Password (docs/security.md S2). The base file's command still runs unchanged; this
+    # entrypoint inserts "-" so valkey-server also reads the two lines below
+    # from stdin, which keeps the password out of the process list. The stock
+    # docker-entrypoint.sh still drops to the valkey user, and valkey-server
+    # stays PID 1. Fluxer connects with FLUXER_KV_URL from fluxer-ha/.env.shared, which
+    # carries the same password.
+    environment:
+      FLUXER_HA_VALKEY_PASSWORD: ${FLUXER_HA_VALKEY_PASSWORD:?set FLUXER_HA_VALKEY_PASSWORD in fluxer-ha/.env.shared}
+      # valkey-cli inside this container (healthcheck, ha-health.sh) uses it.
+      REDISCLI_AUTH: ${FLUXER_HA_VALKEY_PASSWORD:?}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        bin=$$1; shift
+        exec docker-entrypoint.sh "$$bin" - "$$@" <<CONF
+        requirepass $$FLUXER_HA_VALKEY_PASSWORD
+        masterauth $$FLUXER_HA_VALKEY_PASSWORD
+        CONF
+      - sh
+    healthcheck:
+      # `valkey-cli ping` exits 0 even when it gets NOAUTH back (lab,
+      # 2026-10-15), so the base file's check can't see an auth failure.
+      test: ["CMD-SHELL", "valkey-cli ping | grep -qx PONG"]
+
+  seaweedfs:
+    ports:
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:8333:8333"
+      # Filer HTTP and gRPC, for the peer's filer-sync. WireGuard only, and
+      # only the peer site gets through fluxer-ha/firewall.sh (docs/security.md S3/S5). The filer
+      # has no authentication of its own here: SeaweedFS's filer JWT covers
+      # HTTP only, so the gRPC port would also need mutual TLS across master,
+      # volume, filer and S3, which changes the base stack's SeaweedFS. The
+      # peer holds every secret anyway, so peer-only is the boundary.
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:8888:8888"
+      - "${FLUXER_HA_LOCAL_WG_IP:?}:18888:18888"
+
+  # --- Role-following helpers (both sites; they act only on the replica) ----
+  valkey-role-link:
+    <<: *hardened
+    user: "65534:65534"
+    # Every 2 s: local Postgres primary -> REPLICAOF NO ONE.
+    #            peer Postgres primary  -> REPLICAOF <peer>.
+    #            anything else          -> leave Valkey alone.
+    image: ${FLUXER_VALKEY_IMAGE:-valkey/valkey:9.1-alpine}
+    restart: unless-stopped
+    networks: [fluxer]
+    depends_on:
+      valkey: {condition: service_healthy}
+    environment:
+      PEER: ${FLUXER_HA_PEER_WG_IP:?set FLUXER_HA_PEER_WG_IP in fluxer-ha/.env.site}
+      REDISCLI_AUTH: ${FLUXER_HA_VALKEY_PASSWORD:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          info=$$(valkey-cli -h valkey INFO replication 2>/dev/null | tr -d '\r')
+          if wget -q -T 2 -O /dev/null http://postgres:8008/primary; then
+            echo "$$info" | grep -q '^role:master$$' || valkey-cli -h valkey REPLICAOF NO ONE
+          elif wget -q -T 2 -O /dev/null "http://$$PEER:8008/primary"; then
+            echo "$$info" | grep -q "^master_host:$$PEER$$" || valkey-cli -h valkey REPLICAOF "$$PEER" 6379
+          fi
+          sleep 2
+        done
+
+  filer-sync:
+    <<: *hardened
+    user: "65534:65534"
+    # On the replica only: continuously stream every change under /buckets
+    # from the primary's filer to the local one (SeaweedFS filer.sync,
+    # active/passive, chunks read and written through the filers, so only the
+    # filer ports cross WireGuard). Lag is seconds. Stopped on the primary and
+    # restarted in the other direction after a role change. docs/architecture.md, "Media".
+    # The flags exist in SeaweedFS 4.47, and it resumes from the offset it saved
+    # in the target filer (lab: 5 files uploaded during a pause, on the spare 1 s
+    # after the resume).
+    image: ${FLUXER_SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.47}
+    restart: unless-stopped
+    networks: [fluxer]
+    depends_on:
+      seaweedfs: {condition: service_healthy}
+    environment:
+      PEER: ${FLUXER_HA_PEER_WG_IP:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        pid=""
+        while true; do
+          if wget -q -T 2 -O /dev/null http://postgres:8008/replica && wget -q -T 2 -O /dev/null "http://$$PEER:8008/primary"; then
+            if [ -z "$$pid" ] || ! kill -0 "$$pid" 2>/dev/null; then
+              weed filer.sync -a "$$PEER:8888" -b seaweedfs:8888 -isActivePassive \
+                -a.path /buckets -b.path /buckets -a.filerProxy -b.filerProxy &
+              pid=$$!
+              echo starting > /tmp/state
+            else
+              echo syncing > /tmp/state
+            fi
+          else
+            if [ -n "$$pid" ]; then kill "$$pid" 2>/dev/null; pid=""; fi
+            echo idle > /tmp/state
+          fi
+          sleep 2
+        done
+    healthcheck:
+      # Healthy when there's nothing to do (not the replica), or when
+      # filer.sync has stayed up for at least one loop.
+      test: ["CMD", "sh", "-c", "grep -qxE 'idle|syncing' /tmp/state"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  s3-mirror:
+    <<: *hardened
+    # On the replica only: the push-back of stranded uploads after a failover,
+    # then an hourly reconcile from the primary, skipping any object that
+    # can't be read (fluxer-ha/s3-mirror.sh has the details; lab F50, F52).
+    # The SeaweedFS provider and busybox wget in the image were checked in the
+    # lab (2026-10-15).
+    image: ${FLUXER_HA_RCLONE_IMAGE:-rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5}
+    restart: unless-stopped
+    networks: [fluxer]
+    depends_on:
+      seaweedfs-init: {condition: service_completed_successfully}
+    volumes:
+      - s3-mirror-state:/state
+      - ./fluxer-ha/s3-mirror.sh:/s3-mirror.sh:ro
+    environment:
+      RCLONE_CACHE_DIR: /tmp/rclone
+      PEER: ${FLUXER_HA_PEER_WG_IP:?}
+      BUCKETS: >-
+        ${FLUXER_S3_BUCKET_CDN:-fluxer} ${FLUXER_S3_BUCKET_UPLOADS:-fluxer-uploads}
+        ${FLUXER_S3_BUCKET_REPORTS:-fluxer-reports} ${FLUXER_S3_BUCKET_HARVESTS:-fluxer-harvests}
+      INTERVAL: ${FLUXER_HA_S3_MIRROR_INTERVAL_SECONDS:-3600}
+      MAX_DELETE: ${FLUXER_HA_S3_MIRROR_MAX_DELETE:-200}
+      # No time limit on a copy. An rclone run is killed only when it has made
+      # no progress for STALL seconds (lab F50: a sync sat on a read that
+      # never ended, and rclone's own --timeout didn't end it). A run cut
+      # short loses nothing: the next one carries on where it stopped.
+      # OBJECT_STALL is the same for one object, when the mirror looks for
+      # the ones that can't be read (lab F52).
+      STALL: ${FLUXER_HA_S3_MIRROR_STALL_SECONDS:-300}
+      OBJECT_STALL: ${FLUXER_HA_S3_MIRROR_OBJECT_STALL_SECONDS:-60}
+      RCLONE_CONFIG: /dev/null
+      RCLONE_CONFIG_PRIMARY_TYPE: s3
+      RCLONE_CONFIG_PRIMARY_PROVIDER: SeaweedFS
+      RCLONE_CONFIG_PRIMARY_ENDPOINT: http://${FLUXER_HA_PEER_WG_IP:?}:8333
+      RCLONE_CONFIG_PRIMARY_ACCESS_KEY_ID: ${FLUXER_S3_ACCESS_KEY:?}
+      RCLONE_CONFIG_PRIMARY_SECRET_ACCESS_KEY: ${FLUXER_S3_SECRET_KEY:?}
+      RCLONE_CONFIG_LOCAL_TYPE: s3
+      RCLONE_CONFIG_LOCAL_PROVIDER: SeaweedFS
+      RCLONE_CONFIG_LOCAL_ENDPOINT: http://seaweedfs:8333
+      RCLONE_CONFIG_LOCAL_ACCESS_KEY_ID: ${FLUXER_S3_ACCESS_KEY:?}
+      RCLONE_CONFIG_LOCAL_SECRET_ACCESS_KEY: ${FLUXER_S3_SECRET_KEY:?}
+    entrypoint: ["/bin/sh", "/s3-mirror.sh"]
+    healthcheck:
+      # Healthy when this node is the primary (nothing to mirror), or when the
+      # last full reconcile finished within INTERVAL + 10 min.
+      test: ["CMD", "sh", "-c", "[ \"$$(cat /state/role 2>/dev/null)\" = primary ] || [ $$(( $$(date +%s) - $$(cat /state/last_ok 2>/dev/null || echo 0) )) -lt $$(( INTERVAL + 600 )) ]"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+volumes:
+  patroni-data:
+  etcd-data:
+  s3-mirror-state:
