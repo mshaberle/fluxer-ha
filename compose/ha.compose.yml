@@ -114,7 +114,7 @@ services:
       PATRONI_SUPERUSER_PASSWORD: ${FLUXER_HA_PG_SUPERUSER_PASSWORD:?set FLUXER_HA_PG_SUPERUSER_PASSWORD in fluxer-ha/.env.shared}
       PATRONI_REPLICATION_USERNAME: replicator
       PATRONI_REPLICATION_PASSWORD: ${FLUXER_HA_PG_REPLICATION_PASSWORD:?set FLUXER_HA_PG_REPLICATION_PASSWORD in fluxer-ha/.env.shared}
-      # Basic auth on the REST API's unsafe methods (docs/security.md S1). Patroni sends it
+      # Basic auth on the REST API's unsafe methods (docs/security.md S1a). Patroni sends it
       # to the other member itself (failsafe, switchover), and patronictl in
       # this container picks it up from the environment.
       PATRONI_RESTAPI_USERNAME: patroni

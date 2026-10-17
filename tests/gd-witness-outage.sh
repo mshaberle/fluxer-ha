@@ -16,7 +16,7 @@ ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
 eps=$(sed -n 's/^FLUXER_HA_ETCD_INITIAL_CLUSTER=//p' .env | sed 's#[a-z0-9]*=http://\([0-9.]*\):2380#\1:2379#g')
 # etcd's HTTP /health needs no credentials, so the witness never has to hold
-# any (etcd auth is on: 13 S1). `etcdctl endpoint health` without a user now
+# any (etcd auth is on: docs/security.md S1b). `etcdctl endpoint health` without a user now
 # reports every member unhealthy.
 for ep in $(echo "$eps" | tr ',' ' '); do
 	curl -fsS -m 3 "http://$ep/health" | grep -q '"health":"true"' || { echo "ABORT: etcd member $ep not healthy" >&2; exit 1; }

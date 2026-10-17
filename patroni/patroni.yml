@@ -117,7 +117,7 @@ postgresql:
     - host all all samenet scram-sha-256
     # The two sites' WireGuard addresses (/32 each, never the witness) are
     # appended at start-up by entrypoint.py from FLUXER_HA_SITE_WG_IPS.
-    # A whole-mesh rule would let the witness in too (docs/security.md S1).
+    # A whole-mesh rule would let the witness in too (docs/security.md S1c).
 
 watchdog:
   # Hardware-style fencing. If Patroni can't keep renewing its leader lease,
