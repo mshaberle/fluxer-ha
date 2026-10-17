@@ -34,19 +34,37 @@ The DNS `exec` hook is separate: see [dns.md](dns.md).
 
 ## Monitoring
 
-Set up two things. Without them you won't know when you've lost redundancy.
+Set up both of these, in `fluxer-ha/.env.shared`. Without them you won't know when you've lost redundancy. Run the monitor somewhere other than the two sites (and not on the witness), reachable from both over HTTPS, so a site going down can't take its own monitor with it.
 
-1. **`FLUXER_HA_HEARTBEAT_URL`, a dead-man's switch.** The **spare** pings it every 30 s, but only while every condition for an automatic failover holds:
-   - it's the synchronous standby;
-   - etcd has 3 of 3 members;
-   - Valkey and the media mirror are healthy;
-   - the controller is running and the clock is fine;
-   - both sites run the same configuration;
-   - DNS points at the primary;
-   - the firewall is in place.
+| Setting | What it is | Sent | What you use |
+|---|---|---|---|
+| `FLUXER_HA_HEARTBEAT_URL` | A **dead-man's switch**: it alerts when pings **stop** | A GET every 30 s, by the spare's health check, but only while an automatic failover is possible (below) | A push or heartbeat monitor that alerts after **2 minutes** without a ping |
+| `FLUXER_HA_ALERT_URL` | Where events go | A POST whose body is the message, such as `fluxer-ha site2: role changed: not-primary -> primary` | Anything that shows a plain-text POST: an ntfy topic, Gotify, Apprise. Not a Discord or Slack webhook directly (they want JSON) |
 
-   Alert when pings stop for 2 minutes. That alert means "no automatic failover possible right now", which also covers the spare itself being down.
-2. **`FLUXER_HA_ALERT_URL`.** Each event is POSTed to it: role changes, DNS failures, failbacks, a firewall that had to be re-applied, a clock gate holding the app tier.
+**The heartbeat** is sent only while every condition for an automatic failover holds:
+- the spare is the synchronous standby;
+- etcd has 3 of 3 members;
+- Valkey and the media mirror are healthy;
+- the controller is running and the clock is fine;
+- both sites run the same configuration;
+- DNS points at the primary;
+- the firewall is in place.
+
+So its alert means "**no automatic failover is possible right now**". Because it's the silence that alerts, it also covers what can't report itself: the spare powered off or cut off, or its timer not running. One monitor covers both sites: `.env.shared` is the same on both, and whichever is the spare pings.
+
+**Alerts** cover what happens: role changes, DNS failures, failbacks and their roll-backs, a firewall that had to be re-applied, a clock gate holding the app tier, a Valkey repair, objects s3-mirror skips, a hook that failed.
+
+**With Uptime Kuma:**
+- **Heartbeat:** add a monitor of type **Push**, with *Heartbeat Interval* 120 s and *Retries* 0, and a notification of your choice on it. Paste its push URL **without quotes** (fluxer-ha reads the value literally):
+
+  ```
+  FLUXER_HA_HEARTBEAT_URL=https://kuma.example.com/api/push/<token>?status=up&msg=OK&ping=
+  ```
+- **Alerts:** Uptime Kuma can't receive them: posted to a push URL, every alert would only count as a ping, and its text would be lost. Use ntfy instead, for example `FLUXER_HA_ALERT_URL=https://ntfy.sh/<a long random topic>`, and subscribe to that topic.
+
+**Check them** from each site: `curl -fsS -d 'fluxer-ha test' '<alert URL>'` should arrive as a message, and the push monitor should go up within a minute of the spare's health check running with the new setting. Both URLs carry a token: they stay in `.env.shared` (mode 600) and reach curl on stdin, never in its arguments.
+
+Setting or changing them is a configuration change: copy `.env.shared` to the other site byte for byte, `fluxer-ha/build-env.sh` on both, then the rollout ([Changing a setting](#changing-a-setting)).
 
 Also probe the public URL (`/api/_health`) from outside, as you would for a single site.
 
