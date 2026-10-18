@@ -12,16 +12,18 @@ This takes an existing single-site Fluxer install and turns it into a two-site p
 | 3 | all three | `fluxer-ha doctor` |
 | 4 | site 1 | `init` writes the settings; you edit `fluxer-ha/.env.shared`; `bundle` |
 | 5 | site 1 | `install site` |
-| 6 | witness | `install witness`, `witness-up` |
+| 6 | witness | `install witness`, `witness-up` (any time before step 10) |
 | 7 | site 2 | Your reverse proxy (with `--tls proxy` only), unpack the bundle, `install site` |
 | 8 | both sites | `ssh-link` |
-| 9 | site 2 | `etcd-up` |
+| 9 | site 2 only | `etcd-up` |
 | 10 | site 1 | `migrate` (the maintenance window) |
 | 11 | site 2 | `join` |
 | 12 | both sites | `status`, then the drills |
 | 13 | both sites | Clean up what the migration kept for rollback |
 
 Read [architecture.md](architecture.md) first, so the steps make sense.
+
+**Host names in the commands.** `site1`, `site2` and `witness` in commands such as `scp site1:… site2:` are your **workstation's** SSH names for the three hosts: add them to `~/.ssh/config` (with `HostName` and `User`), or type `user@address` instead. fluxer-ha itself never looks a host up by name: everything between the hosts uses the WireGuard addresses you give `init`, so nothing goes in `/etc/hosts`.
 
 **Where it puts things.** Your Fluxer directory can be anywhere; these docs call it `~/fluxer`, so `cd` into yours instead (the two sites' needn't match: the lab ran one from `~/docker/fluxer` and the other from `~/fluxer`). In it, fluxer-ha keeps everything it writes in **one subdirectory, `~/fluxer/fluxer-ha/`**: its scripts, the settings files, the overlays, its state and its backups. It changes only one file of upstream's: `.env`, which it rebuilds from its settings files (step 4). Outside the Fluxer directory, `install` writes the system files that have to live elsewhere (systemd units, the firewall's and the SSH gate's root-owned copies, the watchdog rule), listed in [security.md](security.md#what-runs-as-root). After the install, `~/fluxer` looks like this:
 
@@ -72,6 +74,8 @@ apt install wireguard jq bind9-dnsutils chrony iptables sudo openssh-client open
 ```
 
 **Check your install first.** fluxer-ha supports upstream's layout with the bundled Postgres, Valkey and SeaweedFS, and either TLS mode (`--tls bundled`, the default, or `--tls proxy`). It does **not** support `FLUXER_POSTGRES_URL`, an outside `FLUXER_KV_URL`, `external-object-store.compose.yml` or `tunnel.compose.yml`. `fluxer-ha doctor` checks this for you.
+
+**`FLUXER_KV_URL` must not be set at all,** not even to the bundled Valkey: `init` writes its own, with the password HA adds, and refuses a `.env` that already has one. If yours says `FLUXER_KV_URL=redis://valkey:6379/0`, that's the stack's own default written out: comment the line out (`sed -i 's/^FLUXER_KV_URL=/#FLUXER_KV_URL=/' .env`). Nothing restarts, and a recreated container gets the same address from upstream's compose file. Any other value is an outside Valkey or Redis, which fluxer-ha can't replicate.
 
 **Ports.** In your provider's firewall (and any host firewall):
 
@@ -137,9 +141,21 @@ Your Fluxer name must already have an **A record pointing at site 1** (and an AA
 
 | `--dns` | Set up |
 |---|---|
-| `cloudflare` | The record must be **DNS only** (grey cloud). Create an API token with *Zone → DNS → Edit* for that one zone. You'll need the zone ID and the record ID: `curl -s -H "Authorization: Bearer $TOKEN" "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?name=chat.example.com" \| jq -r '.result[].id'` |
+| `cloudflare` | The record must be **DNS only** (grey cloud): fluxer-ha writes it with `proxied=false`, so a proxied (orange) record would quietly become DNS-only at the first failover. Create an API token with *Zone → DNS → Edit* for that one zone. You'll need the zone ID (on the zone's overview page) and the record ID (below). |
 | `exec` | Write a hook for your DNS provider ([dns.md](dns.md)) |
 | `none` | Something else moves traffic (a floating IP, a load balancer). The HA layer leaves DNS alone. |
+
+**Finding the record ID without the token on screen.** Read the token without echoing it, and give it to curl on stdin, so it stays out of your history and the process list:
+
+```sh
+printf 'Token: '; read -rs TOKEN; echo
+ZONE=<zone ID>
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -s --config - \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?name=chat.example.com" | jq -r '.result[] | "\(.type) \(.id)"'
+unset TOKEN
+```
+
+The `A` line's ID is `FLUXER_HA_CF_RECORD_ID_A` (and `AAAA`'s, if you have one, `_AAAA`). Once the token is in `fluxer-ha/.env.shared` (step 4), `TOKEN=$(sed -n 's/^FLUXER_HA_CF_API_TOKEN=//p' fluxer-ha/.env.shared)` reads it from there instead.
 
 ## 3. Check each host
 
@@ -150,9 +166,15 @@ On every host, from a checkout of this repo, as that account (not root):
 ./fluxer-ha doctor witness   # on the witness
 ```
 
-Fix every `FAIL` line. `doctor` changes nothing. On site 2, before step 7, it reports "no Fluxer directory" as a warning; that's expected.
+Fix every `FAIL` line. `doctor` changes nothing and needs nothing from the later steps: it comes **before** `init`, and `init` runs it again itself. Expected at this point:
+- `FAIL  no WireGuard interface wg0` on any host where step 1 isn't done yet (an admin tunnel of yours on another interface doesn't count);
+- on site 2, before step 7, "no Fluxer directory" as a warning.
+
+On the witness it checks less: the account, Docker and Compose, the tools and `wg0`.
 
 ## 4. Site 1: write the settings
+
+Run it from your Fluxer directory, or give that directory as `fluxer-ha --dir <dir> init …`: **`--dir` goes before the command**, never after it. Once `install` has run, fluxer-ha remembers the directory.
 
 ```sh
 cd ~/fluxer     # the directory install.sh created
@@ -164,7 +186,7 @@ cd ~/fluxer     # the directory install.sh created
 
 More options for `init`:
 - **`--domain <name>`:** the DNS record's name, if it isn't your `FLUXER_DOMAIN`. That's the name fluxer-ha updates and checks; the certificate is always for `FLUXER_DOMAIN`.
-- **`--proxy-network <network>`** (with `--tls proxy`, when your reverse proxy runs in Docker, as in `--proxy-network caddy_default`): puts the edge on your proxy's Docker network through `fluxer-ha/ha.proxy-network.yml`. If you had edited upstream's `docker-compose.proxy.yml` for this, put upstream's file back. `install.sh --update` would overwrite it anyway.
+- **`--proxy-network <network>`** (with `--tls proxy`, when your reverse proxy runs in Docker, as in `--proxy-network caddy_default`): puts the edge on your proxy's Docker network through `fluxer-ha/ha.proxy-network.yml`. `docker network ls` shows the name; Compose calls it `<project>_default`. If you had edited upstream's `docker-compose.proxy.yml` for this, put upstream's file back. `install.sh --update` would overwrite it anyway.
 - **Your own overlays:** any other file in your `COMPOSE_FILE` stays there, after upstream's files and before fluxer-ha's, and `bundle` takes it to site 2. It must sit in `~/fluxer` itself. If one of yours already puts the edge on your proxy's network, don't pass `--proxy-network` as well; `init` warns when both name the same network. (Lab: an overlay `edge-caddy-net.yml` was kept, bundled and flagged; one outside the directory, or missing, was refused.)
 - **`--cert edge|caddy|none`:** where the certificate lives. The default is `edge` for bundled TLS and `caddy` for `--tls proxy`.
 - **`--wg-interface <name>`:** if it isn't `wg0`.
@@ -190,8 +212,10 @@ Each site later builds its own `.env` from its `.env.shared` and `.env.site` (`f
 | `FLUXER_HA_DNS_HOOK` | With `--dns exec`: the path of your hook ([dns.md](dns.md)) |
 | `FLUXER_HA_HEARTBEAT_URL` | A dead-man's-switch URL that alerts when pings **stop**, from healthchecks.io, Uptime Kuma's push monitor or any equivalent. Set it to alert after **2 minutes** without a ping. |
 | `FLUXER_HA_ALERT_URL` | A URL that receives a POST for each event, such as an ntfy topic |
-| `FLUXER_HA_CADDY_DATA_VOLUME`, `FLUXER_HA_CADDY_CONTAINER` | With `--cert caddy`: your Caddy's data volume (the one mounted at `/data`, as in `caddy_caddy_data`) and its container name (as in `caddy-caddy-1`). **Both are shared settings, so they must be the same names on both sites.** |
+| `FLUXER_HA_CADDY_DATA_VOLUME`, `FLUXER_HA_CADDY_CONTAINER` | With `--cert caddy`: your Caddy's data volume (the one mounted at `/data`, as in `caddy_caddy_data`) and its container name (as in `caddy-caddy-1`, or what `container_name:` sets). `docker inspect <container> --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{println}}{{end}}'` lists the volumes. **Both are shared settings, so they must be the same names on both sites.** |
 | `FLUXER_HA_FAILBACK_STABLE_SECONDS`, `FLUXER_HA_FAILBACK_HOURS`, `FLUXER_HA_FAILBACK_ENABLED` | Optional: how long site 1 must be healthy before the primary moves back to it (default 1 h), a time window for that, or off |
+
+**The heartbeat and alert URLs are optional for the install** (without them, events only reach the logs), but set them now if you can. Before `bundle` it's an edit; after `join` it's a configuration change with a rollout. [operations.md](operations.md#monitoring) says what to point them at, Uptime Kuma included.
 
 With `--tls proxy`, also follow [reverse-proxies.md](reverse-proxies.md) for your proxy's site block. The `abort` on 502 matters.
 
@@ -242,11 +266,13 @@ fluxer-ha witness-up
 
 Start it. Until site 2 is primary, it answers your other sites and closes connections for the Fluxer domain. Its certificate for the domain comes from site 1 after `join` (step 11).
 
-Copy `fluxer-ha/init/site2-bundle.tar.gz` to site 2. It holds every secret your instance has, so use `scp`:
+Copy `fluxer-ha/init/site2-bundle.tar.gz` to site 2. It holds every secret your instance has, so use `scp`, for example from your workstation (`-3` copies through it, so the sites need no SSH access to each other):
 
 ```sh
-scp site1:fluxer/fluxer-ha/init/site2-bundle.tar.gz site2:
+scp -3 site1:fluxer/fluxer-ha/init/site2-bundle.tar.gz site2:
 ```
+
+Unpack it into site 2's Fluxer directory. The same path as on site 1 keeps every command the same on both sites, but it may differ.
 
 On site 2:
 
@@ -269,19 +295,33 @@ site2$ fluxer-ha ssh-link --peer-key '<site 1 key>'   # prints site 2's key
 site1$ fluxer-ha ssh-link --peer-key '<site 2 key>'
 ```
 
+Pass the **whole printed line** (`ssh-ed25519 AAAA… fluxer-ha@<host>`) in single quotes, or in double quotes around a variable (`read -r K`, then `--peer-key "$K"`). It must be one line. It's a public key, so it's no secret: on its own it opens nothing, and the peer's copy accepts it only from your WireGuard address and only for the two commands.
+
+How it works: `ssh-link` creates an unprivileged `fluxer-ha` account (not in the `docker` group) whose `authorized_keys` (root-owned) has the peer's key with `restrict`, `from="<peer WireGuard IP>"` and a forced command, `/usr/local/lib/fluxer-ha/ssh-gate.sh`. The gate runs one of two verbs and nothing else: `env-hash` (a hash of `.env.shared` and the image lock, for the drift check) and `cert-receive` (a certificate for the spare; refused on the primary). It runs them as you through a sudo rule that allows exactly those two. [security.md](security.md) has the hardening (S16, S17, S24) and what the lab threw at it.
+
 ## 9. Start site 2's etcd member
 
 ```sh
 site2$ fluxer-ha etcd-up
 ```
 
-All three etcd members must be running before Patroni starts for the first time. A new cluster with a member that has never started reports an old cluster version, and Patroni then waits forever ([lab-results.md](lab-results.md) F34). `migrate` checks that all three answer before it changes anything.
+Run it on **site 2 only**; it refuses on site 1. Each etcd member is started by a different step:
+
+| Member | Started by |
+|---|---|
+| witness | `witness-up` (step 6) |
+| site 2 | `etcd-up` (this step) |
+| site 1 | `migrate` (step 10), during its cut-over |
+
+All three must be running before Patroni starts for the first time: a new cluster with a member that has never started reports an old cluster version, and Patroni then waits forever ([lab-results.md](lab-results.md) F34). So before it changes anything, `migrate` checks that the witness's and site 2's members are running, and stops with "etcd at … isn't running" if either isn't. It then starts site 1's own member itself.
 
 ## 10. Migrate site 1 (the maintenance window)
 
 ```sh
 site1$ fluxer-ha migrate
 ```
+
+**This is the first step that needs the witness.** Everything before it (steps 0–5 and 7–9) works with the witness still off or not set up, and your instance keeps running as before. `migrate` refuses, changing nothing, until the witness's etcd answers (step 6).
 
 1. **Before the window:**
    - checks everything again, including that the witness is reachable;
