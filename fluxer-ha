@@ -175,7 +175,15 @@ cmd_doctor() {
 				case :$cf: in *:tunnel.compose.yml:* | *:external-object-store.compose.yml:*) no "COMPOSE_FILE uses an overlay fluxer-ha doesn't support ($cf)" ;; *) ok "COMPOSE_FILE $cf" ;; esac
 			fi
 			kvurl=$(fileget $envf FLUXER_KV_URL)
-			case $kvurl in '' | *@valkey:6379*) ok "Valkey is the bundled one" ;; *) no "FLUXER_KV_URL points outside the stack; fluxer-ha replicates the bundled Valkey only" ;; esac
+			# init writes its own FLUXER_KV_URL (with Valkey's new password) and
+			# refuses a .env that already has one, even the bundled default.
+			case $kvurl in
+				'') ok "Valkey is the bundled one" ;;
+				redis://valkey:6379* | redis://*@valkey:6379*)
+					if [ -f fluxer-ha/.env.shared ]; then ok "Valkey is the bundled one"
+					else no "FLUXER_KV_URL is set in $envf, to the bundled Valkey: comment that line out before init, which writes its own (docs/install.md, step 0)"; fi ;;
+				*) no "FLUXER_KV_URL points outside the stack; fluxer-ha replicates the bundled Valkey only" ;;
+			esac
 			[ -z "$(fileget $envf FLUXER_POSTGRES_URL)" ] || no "FLUXER_POSTGRES_URL is set: fluxer-ha manages the bundled Postgres only"
 		fi
 	fi
