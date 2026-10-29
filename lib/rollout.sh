@@ -16,6 +16,8 @@
 # survives), Postgres (then waits until it's the synchronous standby again),
 # the rest of the data tier, then the warm tier. The cold tier is re-created
 # but NOT started; the controller starts it when this site is promoted.
+# Containers of services the configuration no longer defines (an upgrade
+# that merged or dropped a service) are removed before the warm tier starts.
 # Last, s3-mirror does a full media sync from the primary, and the rollout
 # waits for it with no time limit (lab F51: a copy of a lot of media takes as
 # long as it takes). It stops only if the sync makes no progress for
@@ -28,9 +30,10 @@
 #   rollout.sh --dry-run  show what Compose would recreate, change nothing
 set -eu
 cd "$(dirname "$0")/.."
-. ./fluxer-ha/tiers.sh
 
 envget() { sed -n "s/^$1=//p" .env | tail -n 1; }
+PROJECT=$(envget COMPOSE_PROJECT_NAME); PROJECT=${PROJECT:-fluxer}
+. ./fluxer-ha/tiers.sh
 DRY=${1:-}
 EPS=$(envget FLUXER_HA_ETCD_HOSTS)
 LOCAL_WG=$(envget FLUXER_HA_LOCAL_WG_IP)
@@ -83,14 +86,15 @@ mirror_progress() {
 
 # --- Preconditions -----------------------------------------------------------
 dc config -q || die "the compose configuration doesn't parse; fix it first"
-all=$(dc config --services | sort)
-known=$(echo "$COLD $WARM $DATA $ONCE" | tr ' ' '\n' | sort)
-unknown=$(echo "$all" | grep -vxF "$known" || true)
+tiers_load || die "the compose configuration doesn't parse; fix it first"
+unknown=$(tiers_unknown)
 [ -z "$unknown" ] || die "services not in fluxer-ha/tiers.sh: $(echo $unknown). Classify them first."
+orphans=$(tiers_orphans | tr '\n' ' ')
 
 if [ "$DRY" = --dry-run ]; then
 	log "dry run. Compose would recreate (or create) on this site:"
 	dc up --dry-run -d --no-deps $DATA $WARM 2>&1 | grep -E 'Recreate|Create' | grep -v 'Recreated\|Created' || echo "  nothing in the data and warm tiers"
+	[ -z "$orphans" ] || echo "  and remove the containers of services the configuration no longer defines: $orphans"
 	! mirror_script_stale || echo "  s3-mirror (its script changed)"
 	echo "  and then a full media sync from the primary"
 	exit 0
@@ -109,6 +113,18 @@ rec=fluxer-ha/upgrade/rollout-$(date -u +%Y%m%dT%H%M%SZ)
 record_images "$rec"
 log "recorded what runs now in $rec ($(wc -l <"$rec/images") images)"
 ls -1d fluxer-ha/upgrade/rollout-* 2>/dev/null | head -n -10 | xargs -r rm -rf
+
+# --- Leftovers -----------------------------------------------------------------
+# Containers of services the configuration no longer defines, first: an old
+# snowflakes-shard running next to the new snowflakes would be a second
+# generator with the same worker ID. This site is the spare, so none of them
+# serves anyone.
+if [ -n "$orphans" ]; then
+	log "removing the containers of services the configuration no longer defines: $orphans"
+	for s in $orphans; do
+		docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=$s" | xargs -r docker rm -f >/dev/null
+	done
+fi
 
 # --- Data tier, in order -----------------------------------------------------
 for s in $DATA; do

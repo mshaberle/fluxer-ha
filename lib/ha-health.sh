@@ -26,7 +26,16 @@ case $fw in
 	*) fail "firewall: ${fw}" ;;
 esac
 
-# 0a. On EVERY site: Valkey that can't load its append-only file is repaired,
+# 0a. On EVERY site: rexctl hasn't taken the instance back. A takeover moves
+#     .env into rexctl's state, drops every FLUXER_HA_ setting and installs
+#     a boot unit that starts the whole stack, warm tier removed (lab,
+#     2026-10-29): failover stops working. An ejected instance is fine.
+if [ -f .rexctl/state.json ] && ! jq -e '.ejected' .rexctl/state.json >/dev/null 2>&1; then
+	fail "rexctl manages this instance (rexctl takeover or upgrade ran here): failover no longer works. rexctl eject hands it back (docs/operations.md, 'rexctl')"
+fi
+! systemctl is-enabled --quiet fluxer.service 2>/dev/null || fail "rexctl's boot unit fluxer.service is enabled: it starts the whole stack at boot, whatever this site's role. rexctl eject removes it"
+
+# 0b. On EVERY site: Valkey that can't load its append-only file is repaired,
 #     and the damaged files kept (lab F49; valkey-repair.sh).
 . ./fluxer-ha/valkey-repair.sh
 valkey_repair
@@ -34,7 +43,7 @@ valkey_repair
 # Only the replica reports. The primary is covered by the public probes.
 curl -fsS -m 2 -o /dev/null http://127.0.0.1:8008/replica 2>/dev/null || exit 0
 
-# 0b. A spare the primary can no longer feed never catches up on its own. Once
+# 0c. A spare the primary can no longer feed never catches up on its own. Once
 #     the primary has dropped this node's replication slot (member_slots_ttl)
 #     or capped it (max_slot_wal_keep_size), and recycled the WAL this node
 #     still needs, Postgres retries "requested WAL segment ... has already been
@@ -185,6 +194,8 @@ pending=$(docker compose --profile app --dry-run up -d --no-deps $DATA $WARM 2>&
 # it only when it's recreated, which Compose doesn't see as a change.
 mcid=$(docker compose ps -q s3-mirror)
 [ -z "$mcid" ] || docker exec "$mcid" cat /s3-mirror.sh 2>/dev/null | cmp -s - fluxer-ha/s3-mirror.sh || pending="${pending}s3-mirror(script) "
+# Containers of services the configuration no longer defines: rollout removes them.
+for o in $(tiers_orphans); do pending="${pending}$o(left over) "; done
 [ -z "$pending" ] || fail "configuration not applied on this site (run fluxer-ha rollout): $pending"
 
 # 9. This spare holds a certificate it could serve for the Fluxer domain the

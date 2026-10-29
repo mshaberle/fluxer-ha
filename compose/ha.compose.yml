@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# fluxer-ha: the two-site overlay. `fluxer-ha install` copies it next to
-# upstream's docker-compose.yml and adds it to COMPOSE_FILE:
+# fluxer-ha: the two-site overlay, data tier. `fluxer-ha install` copies it
+# into fluxer-ha/, next to the application tier's part (ha.app.yml), and init
+# adds both to COMPOSE_FILE:
 #
-#   bundled TLS (upstream default):  docker-compose.yml:ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
-#   your own reverse proxy:          docker-compose.yml:docker-compose.proxy.yml[:ha.proxy-network.yml]:ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
+#   bundled TLS (upstream default):  docker-compose.yml:fluxer-ha/ha.app.yml:fluxer-ha/ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
+#   your own reverse proxy:          docker-compose.yml:docker-compose.proxy.yml[:fluxer-ha/ha.proxy-network.yml]:fluxer-ha/ha.app.yml:fluxer-ha/ha.compose.yml[:fluxer-ha/ha.images.lock.yml]
 #
 # The same file runs on both sites. Nothing in it says which site is primary:
 # Patroni decides (through etcd, with the witness as the third vote) and
@@ -17,18 +18,6 @@
 # state; etcd uses RBAC; Valkey needs a password; fluxer-ha/firewall.sh limits what
 # reaches these ports over WireGuard (docs/security.md).
 # Needs Compose 2.24.4 or newer (for !reset), like upstream's own overlays.
-
-x-warm: &warm
-  # Runs on BOTH sites: no database writes at startup, no inbound traffic.
-  # The controller keeps these up.
-  profiles: [app]
-
-x-cold: &cold
-  # Runs on the PRIMARY only. The controller starts and stops these.
-  # restart "no" stops Docker from bringing them back on a host that has
-  # rebooted as a replica.
-  profiles: [app]
-  restart: "no"
 
 # Containers the HA layer adds (docs/security.md S20): no Linux capabilities,
 # no privilege escalation (setuid binaries in the image stay inert), and a
@@ -43,55 +32,6 @@ x-hardened: &hardened
   tmpfs: [/tmp]
 
 services:
-  # --- Application tier ------------------------------------------------------
-  gateway: *warm
-  media-proxy: *warm
-  static-proxy: *warm
-  snowflakes: *warm
-  # Per-site snowflake worker ID (docs/architecture.md, "Snowflake IDs"). Site 1 keeps worker 0, the stock
-  # value. Site 2 runs its shard as shard 1 of 2, which makes its worker ID 1
-  # (fluxer_snowflakes/src/main.rs passes the shard ID as the worker ID), and
-  # its API and worker request IDs from that shard directly
-  # (FLUXER_SNOWFLAKE_SERVICE_SUBJECT, read in ServiceRegistry.ts:42), so the
-  # router's shard count of 1 never sends anything to a missing shard 0.
-  snowflakes-shard:
-    <<: *warm
-    environment:
-      FLUXER_SVC_SHARD_ID: ${FLUXER_HA_SNOWFLAKE_WORKER_ID:-0}
-      FLUXER_SVC_SHARD_COUNT: ${FLUXER_HA_SNOWFLAKE_SHARD_COUNT:-1}
-  gifs: *warm
-  gifs-shard: *warm
-  unfurl: *warm
-  unfurl-shard: *warm
-
-  # The API, worker and the users/messages shards run schema DDL at startup
-  # (PostgresKvQueryExecutor.ts:856-937, fluxer_svc/src/postgres.rs:96), so
-  # they can only start against a primary.
-  api:
-    <<: *cold
-    environment:
-      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
-  worker:
-    <<: *cold
-    environment:
-      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
-  users: *cold
-  users-shard: *cold
-  messages: *cold
-  messages-shard: *cold
-  push: *cold
-  app-proxy: *cold
-  admin: *cold
-  livekit: *cold
-  # The edge: with bundled TLS it binds 80/443 and gets the certificate; behind
-  # your own proxy it serves plain HTTP for it (docker-compose.proxy.yml).
-  # Because it's cold, a non-primary site serves nothing for the Fluxer domain:
-  # nothing listens (bundled), or your proxy has no upstream (it should then
-  # close the connection: docs/reverse-proxies.md). That's the traffic-side
-  # fence. A proxy must forward ONLY to the edge, never straight to gateway or
-  # media-proxy, which run on both sites.
-  edge: *cold
-
   # --- Postgres under Patroni (both sites) ----------------------------------
   postgres:
     # Runs as postgres (the image's USER); it needs no capabilities, and the

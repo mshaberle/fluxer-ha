@@ -5,6 +5,9 @@
 # host only). Refuses to build if any key appears more than once, so a
 # per-site value can't silently shadow a shared one, or the reverse.
 set -eu
+# sort and comm must agree on one order whatever the login's locale, or the
+# check below misfires ("comm: file 2 is not in sorted order", lab 2026-10-29).
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 
 for f in fluxer-ha/.env.shared fluxer-ha/.env.site; do

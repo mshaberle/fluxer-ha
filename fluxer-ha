@@ -19,7 +19,7 @@ set -eu
 # Debian's 002 would leave state files group-writable (audit H2).
 umask 027
 
-VERSION=0.1.0
+VERSION=0.2.0
 HERE=$(cd "$(dirname "$0")" && pwd)
 # Installed copy: /usr/local/share/fluxer-ha holds the payload.
 if [ -d "$HERE/lib" ]; then PAYLOAD=$HERE; else PAYLOAD=/usr/local/share/fluxer-ha; fi
@@ -74,6 +74,33 @@ resolve_dir() {
 dc() { docker compose --profile app "$@"; }
 pctl() { docker compose exec -T postgres /opt/patroni/bin/patronictl -c /etc/patroni.yml "$@" </dev/null; }
 project() { p=$(envget COMPOSE_PROJECT_NAME); [ -n "$p" ] || p=$(sed -n 's/^name: *//p' docker-compose.yml | head -n 1); say "${p:-fluxer}"; }
+# Pull only what this host doesn't have, so a host without internet access
+# can still set up from images loaded by hand (lab, 2026-10-29).
+pull_missing() { docker compose "$@" pull --policy missing --ignore-buildable --quiet; }
+# Patroni's image is built here. Built once; after a release that changes the
+# Patroni files, `docker compose build postgres` (docs/operations.md, "Upgrades").
+build_patroni() {
+	if docker image inspect fluxer-patroni:local >/dev/null 2>&1; then say "  the Patroni image is here already (docker compose build postgres rebuilds it)"
+	else docker compose build postgres; fi
+}
+
+# fluxer-ha 0.2 runs on stack files from release 2026.1028 on, which merged
+# the five -shard services into the others. Its overlay doesn't name them:
+# on an older stack, site 2's snowflakes-shard would lose its worker ID and
+# mint IDs as site 1 does. So it refuses older stack files everywhere.
+old_stack() { grep -q '^  [a-z]*-shard:' "${1:-docker-compose.yml}" 2>/dev/null; }
+OLD_STACK="these stack files are from before Fluxer release 2026.1028 (they have the -shard services), and fluxer-ha 0.2 runs on 2026.1028 or later. Move to a current release first (docs/operations.md, 'Moving a pair from before release 2026.1028')"
+
+# rexctl (upstream's installer from release 2026.1028 on) keeps its record of
+# an instance in .rexctl/state.json. fluxer-ha runs on an instance rexctl has
+# handed over with `rexctl eject`, never on one it still manages: a rexctl
+# start, upgrade or boot removes every container it doesn't define, the HA
+# services included (lab, 2026-10-29). Prints none, ejected or managed.
+rexctl_state() {
+	if [ ! -f .rexctl/state.json ]; then say none
+	elif jq -e '.ejected' .rexctl/state.json >/dev/null 2>&1; then say ejected
+	else say managed; fi
+}
 
 usage() {
 	cat <<'EOF'
@@ -102,8 +129,8 @@ Running it:
   hold | release              stop / allow automatic failback (preferred site)
   rollout [--dry-run]         apply configuration changes on THIS site (replica only)
   pin [--pull]                pin every image by digest (optional)
-  upgrade-fetch --ref <ref>|--from <dir> [--tag <tag>]
-                              new upstream stack files on THIS site (run on both)
+  upgrade-fetch --release <version>|latest|--from <bundle> [--mint-keys|--keys <file>]
+                              a release's stack files on THIS site (the spare first)
   rollback [--files <dir>] [--yes]
                               undo an upgrade here: files, tag and images, from its records
   version
@@ -185,6 +212,12 @@ cmd_doctor() {
 				*) no "FLUXER_KV_URL points outside the stack; fluxer-ha replicates the bundled Valkey only" ;;
 			esac
 			[ -z "$(fileget $envf FLUXER_POSTGRES_URL)" ] || no "FLUXER_POSTGRES_URL is set: fluxer-ha manages the bundled Postgres only"
+			! old_stack || no "$OLD_STACK"
+			case $(rexctl_state) in
+				ejected) ok "ejected from rexctl (its admin commands keep working on site 1 while it's the primary)" ;;
+				managed) no "rexctl manages this instance: run rexctl eject first (docs/install.md, step 0)" ;;
+			esac
+			! systemctl is-enabled --quiet fluxer.service 2>/dev/null || no "rexctl's boot unit fluxer.service is enabled: rexctl eject removes it"
 		fi
 	fi
 	if ip link show "$wg_if" >/dev/null 2>&1; then ok "WireGuard interface $wg_if"; else no "no WireGuard interface $wg_if (docs/install.md, 'WireGuard')"; fi
@@ -212,6 +245,8 @@ cmd_init() {
 	case $dns in cloudflare | exec | none) ;; *) die "--dns takes cloudflare, exec or none" ;; esac
 	[ -f .env ] || die "no .env in $DIR"
 	[ ! -e fluxer-ha/.env.shared ] || die "fluxer-ha/.env.shared already exists; init runs once"
+	[ "$(rexctl_state)" != managed ] || die "rexctl manages this instance: run rexctl eject first, which writes every setting into .env (docs/install.md, step 0)"
+	! old_stack || die "$OLD_STACK"
 	mkdir -p fluxer-ha && chmod 755 fluxer-ha
 	cmd_doctor site >/dev/null || say "(doctor reports problems; run 'fluxer-ha doctor' to see them)"
 
@@ -226,7 +261,7 @@ cmd_init() {
 	[ "$mode" = bundled ] || newcf="$newcf:docker-compose.proxy.yml"
 	# Your own overlays stay, after upstream's files and before fluxer-ha's,
 	# and the bundle copies them to site 2. They must sit in this directory.
-	extra=$(printf '%s\n' "$cf" | tr ':' '\n' | grep -vxE 'docker-compose\.yml|docker-compose\.proxy\.yml|(fluxer-ha/)?ha\.(compose|proxy-network|images\.lock)\.yml|' || true)
+	extra=$(printf '%s\n' "$cf" | tr ':' '\n' | grep -vxE 'docker-compose\.yml|docker-compose\.proxy\.yml|(fluxer-ha/)?ha\.(app|compose|proxy-network|images\.lock)\.yml|' || true)
 	for o in $extra; do
 		case $o in /* | */*) die "COMPOSE_FILE names $o, outside $DIR: the bundle copies your overlays to site 2 by name, so move it into $DIR and name it there" ;; esac
 		[ -f "$o" ] || die "COMPOSE_FILE names $o, which isn't in $DIR"
@@ -235,7 +270,7 @@ cmd_init() {
 		newcf="$newcf:$o"
 	done
 	[ -z "$proxynet" ] || newcf="$newcf:fluxer-ha/ha.proxy-network.yml"
-	newcf="$newcf:fluxer-ha/ha.compose.yml"
+	newcf="$newcf:fluxer-ha/ha.app.yml:fluxer-ha/ha.compose.yml"
 	domain=${domain:-$(envget FLUXER_DOMAIN)}
 	[ -n "$domain" ] || die "no FLUXER_DOMAIN in .env; pass --domain"
 	[ -z "$(envget FLUXER_KV_URL)" ] || die "FLUXER_KV_URL is set in .env; fluxer-ha replicates the bundled Valkey only"
@@ -283,7 +318,7 @@ FLUXER_HA_FAILBACK_HOURS=
 EOF
 	chmod 600 fluxer-ha/.env.shared
 	for n in 1 2; do
-		if [ $n = 1 ]; then me=$s1wg peer=$s2wg pub=$s1ip peerpub=$s2ip wid=0 cnt=1 subj=svc.snowflakes; else me=$s2wg peer=$s1wg pub=$s2ip peerpub=$s1ip wid=1 cnt=2 subj=svc.snowflakes.shard.1; fi
+		if [ $n = 1 ]; then me=$s1wg peer=$s2wg pub=$s1ip peerpub=$s2ip wid=0 cnt=1 subj=svc.snowflakes sfmode=combined; else me=$s2wg peer=$s1wg pub=$s2ip peerpub=$s1ip wid=1 cnt=2 subj=svc.snowflakes.shard.1 sfmode=shard; fi
 		other=$((3 - n))
 		cat >"$out/site$n.env.site" <<EOF
 # fluxer-ha: fluxer-ha/.env.site for site$n. Never copy it to the other site.
@@ -297,6 +332,7 @@ FLUXER_HA_PUBLIC_IPV4=$pub
 FLUXER_HA_PUBLIC_IPV6=
 FLUXER_HA_PEER_PUBLIC_IPV4=$peerpub
 FLUXER_LIVEKIT_NODE_IP=$pub
+FLUXER_HA_SNOWFLAKE_MODE=$sfmode
 FLUXER_HA_SNOWFLAKE_WORKER_ID=$wid
 FLUXER_HA_SNOWFLAKE_SHARD_COUNT=$cnt
 FLUXER_HA_SNOWFLAKE_SUBJECT=$subj
@@ -304,6 +340,12 @@ EOF
 	done
 	cp "$out/site1.env.site" fluxer-ha/.env.site
 	chmod 600 fluxer-ha/.env.site
+	# The release the stack files come from, which rexctl's record names after
+	# an eject. upgrade-fetch keeps it up to date; leave names it for rexctl.
+	if [ "$(rexctl_state)" = ejected ]; then
+		jq -r '.release // empty' .rexctl/state.json >fluxer-ha/release 2>/dev/null || true
+		[ -s fluxer-ha/release ] || rm -f fluxer-ha/release
+	fi
 	cat >"$out/witness.env" <<EOF
 FLUXER_HA_LOCAL_WG_IP=$wwg
 FLUXER_HA_WG_INTERFACE=$wg_if
@@ -336,7 +378,10 @@ cmd_bundle() {
 		[ -f "$f" ] || die "COMPOSE_FILE names $f, which isn't in $DIR"
 		cp -p "$f" "$tmp/"
 	done
-	for f in fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml; do [ ! -f "$f" ] || cp -p "$f" "$tmp/fluxer-ha/"; done
+	# The edge mounts these (releases from 2026.1028 on), with your own Caddy
+	# snippets and certificates if you added any.
+	for d in caddy.d certs; do [ ! -d "$d" ] || cp -Rp "$d" "$tmp/"; done
+	for f in fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml fluxer-ha/release; do [ ! -f "$f" ] || cp -p "$f" "$tmp/fluxer-ha/"; done
 	cp "$out/site2.env.site" "$tmp/fluxer-ha/.env.site"
 	tar -C "$tmp" -czf "$out/site2-bundle.tar.gz" .
 	rm -r "$tmp"
@@ -413,6 +458,8 @@ cmd_install() {
 	preflight
 	role=${1:-}
 	case $role in site | witness) ;; *) die "install site|witness" ;; esac
+	# Before anything is copied, so a refusal leaves the installed version alone.
+	if [ "$role" = site ]; then resolve_dir; ! old_stack || die "$OLD_STACK"; fi
 	step "the fluxer-ha command, root-owned so that nothing you run as root can be edited by an unprivileged account"
 	asroot install -d -m 755 /etc/fluxer-ha /usr/local/share/fluxer-ha /usr/local/lib/fluxer-ha
 	if [ "$PAYLOAD" != /usr/local/share/fluxer-ha ]; then
@@ -472,7 +519,7 @@ cmd_install() {
 	for f in "$PAYLOAD"/lib/dns/*.sh; do install -m 644 "$f" fluxer-ha/dns/; done
 	for f in "$PAYLOAD"/patroni/*; do install -m 644 "$f" fluxer-ha/patroni/; done
 	for f in "$PAYLOAD"/tests/*; do install -m 755 "$f" fluxer-ha/tests/; done
-	install -m 644 "$PAYLOAD/compose/ha.compose.yml" "$PAYLOAD/compose/ha.proxy-network.yml" "$DIR/fluxer-ha/"
+	install -m 644 "$PAYLOAD/compose/ha.compose.yml" "$PAYLOAD/compose/ha.app.yml" "$PAYLOAD/compose/ha.proxy-network.yml" "$DIR/fluxer-ha/"
 	step "root: the SSH gate, the config, systemd units (installed, not enabled), the watchdog"
 	# Root-owned copies of the two scripts that run with privilege, so root
 	# (and the gate's sudo target) never runs a file an account can edit.
@@ -556,8 +603,13 @@ cmd_ssh_link() {
 		asroot install -d -o root -g root -m 755 "$h/.ssh"
 		printf 'restrict,from="%s",command="/usr/local/lib/fluxer-ha/ssh-gate.sh" %s\n' "$peer" "$peerkey" | asroot_write "$h/.ssh/authorized_keys" 644
 		# Trust the peer's host key as seen over WireGuard, which authenticates
-		# the peer by its key (trust on first use, inside the tunnel).
-		ssh-keygen -F "$peer" -f "$STATE_DIR/ssh/known_hosts" >/dev/null 2>&1 || ssh-keyscan -t ed25519 "$peer" 2>/dev/null >>"$STATE_DIR/ssh/known_hosts"
+		# the peer by its key (trust on first use, inside the tunnel). Passing
+		# the peer's key again says the peer is new or rebuilt: its host key is
+		# read afresh, so a rebuilt peer doesn't fail every check with "host key
+		# changed" (lab, 2026-10-29).
+		ssh-keygen -R "$peer" -f "$STATE_DIR/ssh/known_hosts" >/dev/null 2>&1 || true
+		ssh-keyscan -t ed25519 "$peer" 2>/dev/null >>"$STATE_DIR/ssh/known_hosts"
+		ssh-keygen -F "$peer" -f "$STATE_DIR/ssh/known_hosts" >/dev/null 2>&1 || say "!! couldn't read $peer's host key (is it reachable over WireGuard?): run ssh-link --peer-key again once it is"
 		chmod 644 "$STATE_DIR/ssh/known_hosts"
 		say "peer key installed for $peer"
 	fi
@@ -636,12 +688,18 @@ cmd_migrate() {
 	step "before the window: build the new env, pull the HA images, build Patroni"
 	umask 077
 	cp -p .env fluxer-ha/.env.pre-ha
-	fluxer-ha/build-env.sh >/dev/null
+	# Every secret is in it, whatever mode .env had (an install's was 664).
+	chmod 600 fluxer-ha/.env.pre-ha
+	# Refused before anything changed: leave no copy behind, or the next run
+	# would take it for a migrate that didn't finish.
+	fluxer-ha/build-env.sh >/dev/null || { rm -f fluxer-ha/.env.pre-ha; die "couldn't build the HA .env (above); nothing was changed"; }
 	mv .env .env.ha
 	cp -p fluxer-ha/.env.pre-ha .env
 	hacf=$(fileget .env.ha COMPOSE_FILE)
-	COMPOSE_FILE=$hacf docker compose --env-file .env.ha --profile app pull --ignore-buildable --quiet etcd valkey-role-link filer-sync s3-mirror
-	COMPOSE_FILE=$hacf docker compose --env-file .env.ha build postgres
+	COMPOSE_FILE=$hacf docker compose --env-file .env.ha --profile app pull --policy missing --ignore-buildable --quiet etcd valkey-role-link filer-sync s3-mirror
+	# (A variable assignment before a shell function isn't reliably exported.)
+	if docker image inspect fluxer-patroni:local >/dev/null 2>&1; then say "  the Patroni image is here already (docker compose build postgres rebuilds it)"
+	else COMPOSE_FILE=$hacf docker compose --env-file .env.ha build postgres; fi
 	# Next to the instance, like upstream's own backups (<dir>/backups).
 	BACKUP_DIR=$DIR/fluxer-ha/backups
 	mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
@@ -664,7 +722,9 @@ cmd_migrate() {
 		docker volume rm "${proj}_patroni-data" >/dev/null 2>&1 || true
 		cp -p fluxer-ha/.env.pre-ha .env
 		docker compose up -d --remove-orphans
-		rm -f fluxer-ha/.env.pre-ha .env.ha
+		# .env.built records the HA .env this run built; kept, the next run's
+		# build-env would take the single-site .env for hand edits (lab, 2026-10-29).
+		rm -f fluxer-ha/.env.pre-ha .env.ha fluxer-ha/.env.built
 		die "rolled back to the previous stack; the old database volume was never touched. Dump: $dump"
 	}
 	t0=$(date +%s)
@@ -672,6 +732,10 @@ cmd_migrate() {
 	svcs=$(docker compose config --services | grep -vx postgres | tr '\n' ' ')
 	# shellcheck disable=SC2086
 	docker compose stop $svcs
+	# Counted again now that nothing writes: the count before the window only
+	# proved the query works, and writes made since then are in the dump (lab,
+	# 2026-10-29: 8 messages sent meanwhile failed the comparison).
+	before=$(docker compose exec -T postgres psql -U "$pguser" -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null) || rollback
 	docker compose exec -T postgres pg_dump -U "$pguser" -d "$pgdb" -Fc </dev/null >"$dump" || rollback
 	say "  dump: $dump ($(du -h "$dump" | cut -f1)), $before rows in $kv"
 	docker compose stop postgres
@@ -694,7 +758,18 @@ cmd_migrate() {
 select format('create role %I login password %L', :'u', :'pw') \gexec
 select format('create database %I owner %I', :'d', :'u') \gexec
 SQL
-	docker compose exec -T postgres pg_restore -U postgres -d "$pgdb" --no-owner --role="$pguser" <"$dump" || rollback
+	# Extensions first, as Patroni's superuser, then everything else without
+	# them. The restore runs as the database's own role, which upstream's
+	# Postgres image makes a superuser and Patroni doesn't, and a database the
+	# release-2026.1028 API set up holds pg_stat_statements, which only a
+	# superuser may create (lab, 2026-10-29: the restore failed on it).
+	toc=$(docker compose exec -T postgres pg_restore -l <"$dump") || rollback
+	for e in $(say "$toc" | sed -n 's/^[0-9]*; [0-9]* [0-9]* EXTENSION - \([A-Za-z0-9_]*\) .*/\1/p'); do
+		docker compose exec -T postgres psql -U postgres -d "$pgdb" -v ON_ERROR_STOP=1 -qc "create extension if not exists \"$e\"" </dev/null || rollback
+		say "  extension $e created"
+	done
+	say "$toc" | grep -v ' EXTENSION ' | docker compose exec -T postgres sh -c 'cat >/tmp/restore.list' || rollback
+	docker compose exec -T postgres pg_restore -U postgres -d "$pgdb" --no-owner --role="$pguser" -L /tmp/restore.list <"$dump" || rollback
 	after=$(docker compose exec -T postgres psql -U postgres -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null 2>/dev/null || echo none)
 	[ "$before" = "$after" ] || { say "!! $kv: $before rows before, $after after"; rollback; }
 	say "  restored: $after rows in $kv"
@@ -820,8 +895,13 @@ cmd_leave() {
 	# the stack that names the network (upstream's reverse-proxy docs, "Docker
 	# labels"). At the top of the Fluxer directory, so deleting fluxer-ha/
 	# afterwards leaves the stack working, and with the network written in, so
-	# no FLUXER_HA_ setting stays behind.
-	pnf=proxy-network.compose.yml
+	# no FLUXER_HA_ setting stays behind. Named custom.compose.yml, rexctl's
+	# name for your own compose file, so `rexctl takeover` accepts the result;
+	# rexctl takes one such file only, so if you have one already this goes
+	# into proxy-network.compose.yml and you combine the two before a takeover.
+	own=$(envget COMPOSE_FILE | tr ':' '\n' | grep -vxE 'docker-compose\.yml|docker-compose\.proxy\.yml|ipv6\.compose\.yml|tunnel\.compose\.yml|external-object-store\.compose\.yml|fluxer-ha/.*|' || true)
+	pnf=custom.compose.yml
+	if [ -n "$own" ] || { [ -e "$pnf" ] && ! grep -q '^# Written by fluxer-ha leave' "$pnf"; }; then pnf=proxy-network.compose.yml; fi
 	if [ -n "$pn" ]; then
 		cat >"$BACKUP_DIR/$pnf.new" <<EOF
 # Written by fluxer-ha leave on $(date -u +%F): puts the Fluxer edge on your
@@ -841,13 +921,19 @@ EOF
 		[ ! -e "$pnf" ] || grep -q '^# Written by fluxer-ha leave' "$pnf" ||
 			die "$DIR/$pnf exists and isn't fluxer-ha's: move it aside (leave writes your proxy network into a file of that name)"
 	fi
-	cf=$(envget COMPOSE_FILE | tr ':' '\n' | grep -vx 'fluxer-ha/ha.compose.yml' | sed "s#^fluxer-ha/ha.proxy-network.yml\$#$pnf#" | { if [ -n "$pn" ]; then cat; else grep -vx "$pnf"; fi; } | paste -sd: -)
+	cf=$(envget COMPOSE_FILE | tr ':' '\n' | grep -vxE 'fluxer-ha/ha\.(compose|app)\.yml' | sed "s#^fluxer-ha/ha.proxy-network.yml\$#$pnf#" | { if [ -n "$pn" ]; then cat; else grep -vx "$pnf"; fi; } | paste -sd: -)
 	{
 		grep -v '^# GENERATED by fluxer-ha/build-env.sh' .env | grep -Ev '^FLUXER_HA_[A-Z0-9_]*=|^COMPOSE_FILE=' |
 			grep -Ev '^FLUXER_KV_URL=.*FLUXER_HA_VALKEY_PASSWORD'
 		echo "COMPOSE_FILE=$cf"
 	} >"$BACKUP_DIR/.env.single-$ts"
 	chmod 600 "$BACKUP_DIR/.env.single-$ts"
+	# Upstream's Postgres image, before the window: under HA nothing ran it,
+	# so a prune may have removed it, and finding that out after the dump
+	# costs a rollback (lab, 2026-10-29).
+	step "before the window: upstream's Postgres image"
+	docker compose -f docker-compose.yml --env-file "$BACKUP_DIR/.env.single-$ts" pull --policy missing --quiet postgres ||
+		die "couldn't get upstream's Postgres image (docker compose pull postgres); nothing was changed"
 
 	rollback() {
 		say "!! leave failed: putting the HA stack back on this site"
@@ -867,6 +953,8 @@ EOF
 	asroot systemctl disable --now fluxer-ha-controller.service fluxer-ha-health.timer fluxer-ha-failback.timer fluxer-ha-certs.timer >/dev/null 2>&1 || true
 	# shellcheck disable=SC2046
 	dc stop $(dc config --services | grep -vxE 'postgres|etcd') >/dev/null 2>&1
+	# Counted again now that nothing writes (as in migrate).
+	before=$(docker compose exec -T postgres psql -U postgres -d "$pgdb" -Atq -c "select count(*) from $kv" </dev/null) || rollback
 	docker compose exec -T postgres pg_dump -U postgres -d "$pgdb" -Fc </dev/null >"$dump" || rollback
 	say "  dump: $dump ($(du -h "$dump" | cut -f1)), $before rows in $kv"
 
@@ -874,7 +962,8 @@ EOF
 	for sv in postgres etcd valkey-role-link filer-sync s3-mirror; do
 		docker ps -aq --filter "label=com.docker.compose.project=$proj" --filter "label=com.docker.compose.service=$sv" | xargs -r docker rm -f >/dev/null
 	done
-	[ "$replace" = 0 ] || docker volume rm "${proj}_postgres-data" >/dev/null || rollback
+	# Only if it's there: an earlier leave that rolled back may have removed it.
+	[ "$replace" = 0 ] || ! docker volume inspect "${proj}_postgres-data" >/dev/null 2>&1 || docker volume rm "${proj}_postgres-data" >/dev/null || rollback
 	[ -z "$pn" ] || install -m 644 "$BACKUP_DIR/$pnf.new" "$pnf"
 	cp -p "$BACKUP_DIR/.env.single-$ts" .env
 	docker compose up -d --no-deps postgres || rollback
@@ -904,6 +993,13 @@ EOF
 	[ -z "$pn" ] || say "Keep $DIR/$pnf: COMPOSE_FILE names it, and it puts the edge on $pn for your proxy."
 	say "  the HA volumes:    docker volume rm ${proj}_patroni-data ${proj}_etcd-data ${proj}_s3-mirror-state"
 	say "Then on the witness: fluxer-ha leave"
+	# What rexctl needs to take it over (docs/operations.md, "rexctl").
+	rel=$(cat fluxer-ha/release 2>/dev/null || true)
+	say ""
+	if [ -n "$rel" ]; then say "To hand this instance to rexctl: rexctl takeover, in $DIR, with rexctl $rel."
+	else say "To hand this instance to rexctl: rexctl takeover, in $DIR, with the latest rexctl. It adopts this stack as it is; rexctl upgrade then moves it to the newest release."; fi
+	case :$cf: in *:fluxer-ha/*) say "  First take $(say "$cf" | tr ':' '\n' | grep '^fluxer-ha/' | paste -sd' ' -) out of COMPOSE_FILE in .env: rexctl reads your own compose files from the top of this directory only." ;; esac
+	[ "$pnf" != proxy-network.compose.yml ] || [ -z "$pn" ] || say "  First combine $pnf with your own compose file into custom.compose.yml: rexctl takes one."
 }
 
 # ----------------------------------------------------------------------------
@@ -914,7 +1010,7 @@ cmd_etcd_up() {
 	[ -f fluxer-ha/.env.shared ] && [ -f fluxer-ha/.env.site ] && [ -x fluxer-ha/build-env.sh ] || die "unpack the site 2 bundle into $DIR and run fluxer-ha install site first"
 	[ "$(fileget fluxer-ha/.env.site FLUXER_HA_SITE)" = site2 ] || die "etcd-up runs on site 2 (site 1's migrate starts its own)"
 	fluxer-ha/build-env.sh >/dev/null
-	docker compose pull --quiet etcd
+	docker compose pull --policy missing --quiet etcd
 	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer
 	docker compose up -d --no-deps etcd
 	say "site 2's etcd member is running. Next, on site 1: fluxer-ha migrate"
@@ -934,8 +1030,8 @@ cmd_join() {
 	peer=$(envget FLUXER_HA_PEER_WG_IP)
 	[ "$(code "http://$peer:8008/primary")" = 200 ] || die "site 1 ($peer) isn't the Patroni primary yet"
 	step "images"
-	docker compose --profile app pull --ignore-buildable --quiet
-	docker compose build postgres
+	pull_missing --profile app
+	build_patroni
 	step "etcd and the firewall"
 	asroot systemctl enable --now fluxer-ha-firewall.service fluxer-ha-firewall-check.timer
 	docker compose up -d --no-deps etcd
@@ -998,55 +1094,200 @@ cmd_rollout() { preflight; resolve_dir; exec ./fluxer-ha/rollout.sh "$@"; }
 cmd_pin() { preflight; resolve_dir; exec ./fluxer-ha/pin-images.sh "$@"; }
 
 # ----------------------------------------------------------------------------
-# upgrade-fetch: new upstream stack files on THIS site. Run it the same way on
-# both sites (or run it on one and copy the files). It never restarts
-# anything: `fluxer-ha rollout` on the replica does that.
+# upgrade-fetch: a release's stack files on THIS site. From release 2026.1028
+# on, upstream ships them with each release, as the compose bundle
+# fluxer-compose-<version>.tar.gz, next to fluxer-release-<version>.json,
+# which lists every Fluxer image's digest (docs/operations.md, "Upgrades").
+# It never restarts anything: `fluxer-ha rollout` on the spare does that.
+#
+# The files of this kind, kept in the record for `rollback`:
+STACK_FILES="docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example ipv6.compose.yml tunnel.compose.yml external-object-store.compose.yml"
+# Secrets a release can add, generated as rexctl does (fluxer_rexctl,
+# internal/secrets). The ones that guard stored data never are: they exist
+# already, and a new value would lock the data out.
+MINT_HEX="FLUXER_SUDO_MODE_SECRET FLUXER_CONNECTION_INITIATION_SECRET FLUXER_PROFILE_PSEUDONYM_SECRET FLUXER_GATEWAY_RPC_AUTH_TOKEN FLUXER_ERLANG_COOKIE FLUXER_MEDIA_PROXY_SECRET_KEY FLUXER_ADMIN_SECRET_KEY_BASE FLUXER_ADMIN_OAUTH_CLIENT_SECRET"
+MINT_B64="FLUXER_MEDIA_PROXY_UPLOAD_RELAY_SECRET_BASE64"
+MINT_RSA="FLUXER_ACTIVITYPUB_SIGNING_KEY_BASE64"
+STATEFUL="POSTGRES_PASSWORD MEILI_MASTER_KEY FLUXER_S3_SECRET_KEY LIVEKIT_API_SECRET FLUXER_VAPID_PUBLIC_KEY FLUXER_VAPID_PRIVATE_KEY"
+inlist() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
+mint() {
+	if inlist "$1" "$MINT_HEX"; then openssl rand -hex 32
+	elif inlist "$1" "$MINT_B64"; then openssl rand -base64 32
+	else openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 | tr -d '\n'; fi
+}
+haskey() { grep -q "^$1=" fluxer-ha/.env.shared fluxer-ha/.env.site; }
+
 cmd_upgrade_fetch() {
 	preflight; resolve_dir
-	ref= tag= from=
+	rel= from= keysf= mintkeys=0 onprimary=0
 	while [ $# -gt 0 ]; do
-		case $1 in --ref) ref=$2; shift ;; --tag) tag=$2; shift ;; --from) from=$2; shift ;; *) die "upgrade-fetch: unknown option $1" ;; esac
+		case $1 in
+			--release) rel=$2; shift ;; --from) from=$2; shift ;;
+			--keys) keysf=$2; shift ;; --mint-keys) mintkeys=1 ;; --on-primary) onprimary=1 ;;
+			--ref) die "--ref is gone: from release 2026.1028 on, upstream's stack files ship with each release, not in the repository. Use --release <version> (docs/operations.md, 'Upgrades')" ;;
+			*) die "upgrade-fetch: unknown option $1" ;;
+		esac
 		shift
 	done
-	[ -n "$ref" ] || [ -n "$from" ] || die "upgrade-fetch needs --ref <git ref> (or --from <dir> with the files)"
-	new=$(mktemp -d)
-	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example; do
-		if [ -n "$from" ]; then cp "$from/$f" "$new/$f"
-		else curl -fsSL --proto '=https' --tlsv1.2 -o "$new/$f" "https://raw.githubusercontent.com/fluxerapp/fluxer/$ref/deploy/self-hosting/$f" || die "download of $f at $ref failed"
-		fi
-		[ -s "$new/$f" ] || die "$f is empty"
-	done
-	grep -q '^services:' "$new/docker-compose.yml" || die "the new docker-compose.yml has no services block"
+	[ -n "$rel" ] || [ -n "$from" ] || die "upgrade-fetch needs --release <version>|latest (https://github.com/fluxerapp/fluxer/releases), or --from <bundle>"
+	if [ "$rel" = latest ]; then
+		# Upstream's install instructions fetch https://fluxer.dev/compose/latest,
+		# which redirects to the newest release's bundle on GitHub. Only its
+		# version is taken from there: both sites must fetch the same release,
+		# and "latest" can move between their two runs.
+		rel=$(curl -sSIL -m 30 --proto '=https' https://fluxer.dev/compose/latest 2>/dev/null |
+			sed -n 's/^[Ll]ocation: .*fluxer-compose-\([0-9.]*\)\.tar\.gz.*/\1/p' | head -n 1 | tr -d '\r')
+		[ -n "$rel" ] || die "couldn't work out which release https://fluxer.dev/compose/latest points to: pass --release <version>"
+		say "latest is release $rel: pass --release $rel on the other site"
+	fi
+	[ -z "$rel" ] || say "$rel" | grep -Eqx '[0-9]{4}\.[0-9]{4}\.[0-9]{6}' || die "--release takes a version like 2026.1028.192211"
+	[ "$mintkeys" = 0 ] || [ -z "$keysf" ] || die "--mint-keys on the first site, --keys <file> on the other: not both"
+	[ -z "$keysf" ] || [ -r "$keysf" ] || die "can't read $keysf"
+	# The spare first. On the primary, the controller starts any app container
+	# that stops from the files on disk, so new files there could mix two
+	# versions in the running instance before the switchover.
+	if is_primary_local && [ "$onprimary" = 0 ]; then
+		die "this site is the primary. Fetch on the spare, roll it out and switch over first; then fetch here, as the spare (docs/operations.md, 'Upgrades'). --on-primary overrides this."
+	fi
+	work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+	new=$work/files; mkdir "$new"
+	json=
+	if [ -n "$rel" ]; then
+		base="https://github.com/fluxerapp/fluxer/releases/download/fluxer-release%40$rel"
+		step "downloading release $rel"
+		curl -fsSL --proto '=https' --tlsv1.2 -o "$work/fluxer-compose-$rel.tar.gz" "$base/fluxer-compose-$rel.tar.gz" ||
+			die "download of fluxer-compose-$rel.tar.gz failed: is $rel a release with a compose bundle?"
+		curl -fsSL --proto '=https' --tlsv1.2 -o "$work/fluxer-release-$rel.json" "$base/fluxer-release-$rel.json" ||
+			die "download of fluxer-release-$rel.json failed"
+		from=$work/fluxer-compose-$rel.tar.gz; json=$work/fluxer-release-$rel.json
+	elif [ -f "$from" ]; then
+		# A bundle downloaded by hand: its list, if it sits next to it.
+		v=$(basename "$from" | sed -n 's/^fluxer-compose-\(.*\)\.tar\.gz$/\1/p')
+		[ -z "$v" ] || [ ! -f "$(dirname "$from")/fluxer-release-$v.json" ] || json=$(dirname "$from")/fluxer-release-$v.json
+		rel=$v
+	elif [ -d "$from" ]; then
+		# A directory: an unpacked bundle, or what `rexctl bundle --out <dir>`
+		# writes (the files built into a rexctl binary you've checked).
+		v=$(ls "$from" 2>/dev/null | sed -n 's/^fluxer-release-\(.*\)\.json$/\1/p' | head -n 1)
+		[ -z "$v" ] || { json=$from/fluxer-release-$v.json; rel=$v; }
+	else die "no such bundle: $from"; fi
+	if [ -f "$from" ]; then
+		# Only plain paths inside the bundle.
+		tar -tzf "$from" >"$work/list" || die "$from isn't a .tar.gz"
+		! grep -Eq '^/|(^|/)\.\.(/|$)' "$work/list" || die "$from holds paths outside itself; refusing it"
+		tar -xzf "$from" -C "$new" --no-same-owner --no-same-permissions || die "couldn't unpack $from"
+	else
+		cp -R "$from/." "$new/"
+	fi
+	[ -f "$new/docker-compose.yml" ] && grep -q '^services:' "$new/docker-compose.yml" || die "no docker-compose.yml with services in $from"
+	! old_stack "$new/docker-compose.yml" || die "the new files are from a release before 2026.1028 (they have the -shard services), which fluxer-ha 0.2 doesn't run on"
+
+	step "checks"
+	if [ -n "$json" ]; then
+		jq -e '.components | length > 0' "$json" >/dev/null 2>&1 || die "$(basename "$json") isn't a release's image list"
+		jv=$(jq -r '.version' "$json")
+		[ -z "$rel" ] || [ "$jv" = "$rel" ] || die "$(basename "$json") is for $jv, not $rel"
+		rel=$jv; n=0
+		for img in $(sed -n 's#^ *image: *\(ghcr\.io/fluxerapp/[^@ ]*@sha256:[0-9a-f]\{64\}\).*#\1#p' "$new/docker-compose.yml" | sort -u); do
+			jq -e --arg i "${img%@*}" --arg d "${img#*@}" '.components[] | select(.image == $i and .digest == $d)' "$json" >/dev/null ||
+				die "docker-compose.yml runs $img, which isn't in release $rel's image list: refusing these files"
+			n=$((n + 1))
+		done
+		[ "$n" -gt 0 ] || die "docker-compose.yml pins no Fluxer image by digest: not a release's bundle?"
+		say "  ok: $n Fluxer images, pinned by digest, each in release $rel's list"
+	else
+		say "  !! no fluxer-release-<version>.json next to the files: their image digests aren't checked against a release"
+	fi
 	# Patroni runs its own Postgres; a major version change is a separate,
 	# manual procedure (dump and restore) for both upstream and this layer.
 	newmaj=$(sed -n 's/.*FLUXER_POSTGRES_IMAGE:-postgres:\([0-9]*\).*/\1/p' "$new/docker-compose.yml" | head -n 1)
 	patmaj=$(sed -n 's/^FROM postgres:\([0-9]*\).*/\1/p' fluxer-ha/patroni/Dockerfile)
 	[ "$newmaj" = "$patmaj" ] || die "the new release uses Postgres $newmaj and Patroni runs $patmaj: a major upgrade isn't automated (docs/operations.md)"
+	say "  ok: Postgres $newmaj, as Patroni runs"
+	# Settings the new files need that this instance doesn't have. Secrets
+	# must be the same on both sites: generated once, on the first site, and
+	# carried to the other in a file.
+	need= newopt=
+	for k in $(sed -n 's/^#\{0,1\}\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$new/.env.example" 2>/dev/null | sort -u); do
+		haskey "$k" && continue
+		[ "$k" != FLUXER_SETTINGS_LOADED ] || continue   # added below
+		if inlist "$k" "$MINT_HEX $MINT_B64 $MINT_RSA"; then need="$need $k"
+		elif inlist "$k" "$STATEFUL"; then die "this instance has no $k, which guards stored data: it can't be generated now. Check fluxer-ha/.env.shared"
+		elif ! grep -q "^#\{0,1\}$k=" .env.example 2>/dev/null; then newopt="$newopt $k"
+		fi
+	done
+	if [ -n "$need" ]; then
+		if [ -n "$keysf" ]; then
+			for k in $need; do [ -n "$(fileget "$keysf" "$k")" ] || die "$keysf has no $k"; done
+		elif [ "$mintkeys" = 0 ]; then
+			die "release ${rel:-?} needs secrets this instance doesn't have yet:$need
+They must be the same on both sites. On the first site (the spare), run this again with --mint-keys:
+it generates them and writes them to fluxer-ha/upgrade/<time>/new-keys.env. Copy that file to
+the other site and pass it there with --keys <file>."
+		fi
+	fi
+
 	keep=$DIR/fluxer-ha/upgrade/$(date -u +%Y%m%dT%H%M%SZ)
 	mkdir -p "$keep" && chmod 700 "$DIR/fluxer-ha/upgrade" "$keep"
-	# What fluxer-ha rollback puts back: the tag and the image lock as they were.
+	# What fluxer-ha rollback puts back: the tag, the image lock and the
+	# release as they were.
 	[ ! -f fluxer-ha/ha.images.lock.yml ] || cp -p fluxer-ha/ha.images.lock.yml "$keep/"
+	[ ! -f fluxer-ha/release ] || cp -p fluxer-ha/release "$keep/release"
 	# And the images this site runs, before the pull moves any tag.
 	. ./fluxer-ha/record-images.sh
 	record_images "$keep"
 	fileget fluxer-ha/.env.shared FLUXER_IMAGE_TAG >"$keep/image-tag"
-	step "changes"
-	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example; do
-		if cmp -s "$f" "$new/$f"; then say "  $f unchanged"; else say "  $f CHANGED"; cp -p "$f" "$keep/" 2>/dev/null || true; install -m 644 "$new/$f" "$f"; fi
-	done
-	rm -r "$new"
-	if [ -n "$tag" ]; then
-		sed -i "s/^FLUXER_IMAGE_TAG=.*/FLUXER_IMAGE_TAG=$tag/" fluxer-ha/.env.shared
-		grep -q '^FLUXER_IMAGE_TAG=' fluxer-ha/.env.shared || printf 'FLUXER_IMAGE_TAG=%s\n' "$tag" >>fluxer-ha/.env.shared
+	step "settings"
+	added=
+	if grep -q 'FLUXER_SETTINGS_LOADED:?' "$new/docker-compose.yml" && ! haskey FLUXER_SETTINGS_LOADED; then
+		# The new docker-compose.yml refuses to start without it (rexctl's
+		# guard against running a stack it manages by hand). Not a secret.
+		printf '\n# Added by fluxer-ha upgrade-fetch, release %s\nFLUXER_SETTINGS_LOADED=true\n' "${rel:-?}" >>fluxer-ha/.env.shared
+		added="$added FLUXER_SETTINGS_LOADED"
 	fi
+	if [ -n "$need" ]; then
+		umask 077
+		# No date in the comment: both sites' files must stay byte-identical,
+		# whichever day each fetches.
+		[ -n "$added" ] || printf '\n# Added by fluxer-ha upgrade-fetch, release %s\n' "${rel:-?}" >>fluxer-ha/.env.shared
+		for k in $need; do
+			if [ -n "$keysf" ]; then v=$(fileget "$keysf" "$k"); else v=$(mint "$k"); fi
+			[ -n "$v" ] || die "couldn't generate $k"
+			printf '%s=%s\n' "$k" "$v" >>fluxer-ha/.env.shared
+			[ -n "$keysf" ] || printf '%s=%s\n' "$k" "$v" >>"$keep/new-keys.env"
+			added="$added $k"
+		done
+		umask 027
+	fi
+	[ -z "$added" ] && say "  nothing to add" || say "  added to fluxer-ha/.env.shared:$added"
+	[ -z "$newopt" ] || say "  new optional settings in this release (.env.example says what they do):$newopt"
+
+	step "changes"
+	for f in $STACK_FILES; do
+		[ -f "$new/$f" ] || continue
+		if cmp -s "$f" "$new/$f"; then say "  $f unchanged"
+		else say "  $f $([ -f "$f" ] && echo CHANGED || echo new)"; [ ! -f "$f" ] || cp -p "$f" "$keep/"; install -m 644 "$new/$f" "$f"; fi
+	done
+	# The edge mounts these; your own snippets and certificates in them stay.
+	for d in caddy.d certs; do
+		[ -d "$new/$d" ] || continue
+		[ -d "$d" ] || { mkdir -p "$d" && chmod 755 "$d" && say "  $d/ new"; }
+		for f in "$new/$d"/*; do [ ! -f "$f" ] || [ -e "$d/$(basename "$f")" ] || install -m 644 "$f" "$d/"; done
+	done
+	[ -z "$rel" ] || printf '%s\n' "$rel" >fluxer-ha/release
 	./fluxer-ha/build-env.sh | tail -n 1
 	docker compose --profile app config -q || say "!! the new files need a setting .env doesn't have: compare .env.example, then edit fluxer-ha/.env.shared on both sites"
 	say ""
-	say "Old files in $keep. Nothing restarted. Next (docs/operations.md, 'Upgrades'):"
-	say "  1. the same on the other site (the fluxer-ha/.env.shared hashes must match)"
-	say "  2. pull on both (with pinning: fluxer-ha pin --pull on one, copy fluxer-ha/ha.images.lock.yml, pull on the other)"
-	say "  3. fluxer-ha rollout on the replica, fluxer-ha switchover, fluxer-ha rollout on the other site"
-	say "To undo before the switchover: fluxer-ha rollback (docs/operations.md, 'Rolling back')."
+	say "Old files in $keep. Nothing restarted."
+	[ ! -f "$keep/new-keys.env" ] || say "New secrets in $keep/new-keys.env: copy it to the other site for its upgrade-fetch (--keys), then delete both copies."
+	say "Next (docs/operations.md, 'Upgrades'):"
+	say "  1. docker compose --profile app pull --ignore-buildable   (here)"
+	say "  2. fluxer-ha rollout                                       (here, the spare)"
+	say "  3. if the other site hasn't fetched release ${rel:-<this one>} yet: fluxer-ha switchover, then there,"
+	say "     as the spare: upgrade-fetch --release ${rel:-<the same>}$([ -z "$need" ] || [ -n "$keysf" ] || echo ' --keys <new-keys.env>'), the pull, rollout"
+	say "Until both sites have it, their health checks report that fluxer-ha/.env.shared differs."
+	[ -z "$rel" ] || say "rexctl $rel matches these files: use that version for its admin commands, and for rexctl takeover after fluxer-ha leave."
+	say "To undo before the switchover: fluxer-ha rollback (docs/operations.md, 'Undoing an upgrade')."
 }
 
 # ----------------------------------------------------------------------------
@@ -1073,6 +1314,9 @@ cmd_rollback() {
 		[ -n "$files" ] || die "no record to roll back to: neither fluxer-ha upgrade-fetch nor install.sh --update has run here"
 	fi
 	files=$(cd "$files" 2>/dev/null && pwd) || die "no such record: $files"
+	# Back to a release before 2026.1028 isn't possible under 0.2's overlay;
+	# that's for rexctl, after fluxer-ha leave (rexctl rollback).
+	! old_stack "$files/docker-compose.yml" || die "$files holds stack files from before release 2026.1028, which fluxer-ha 0.2 doesn't run on"
 	# The first rollout after that record: it wrote down the versions the
 	# upgrade replaced (newest first, so the last match is the earliest).
 	first_rollout=
@@ -1093,10 +1337,11 @@ cmd_rollback() {
 	tag_old=$(head -n 1 "$files/image-tag" 2>/dev/null || true)
 	tag_now=$(fileget fluxer-ha/.env.shared FLUXER_IMAGE_TAG)
 	[ -z "$tag_old" ] || [ "$tag_old" = "$tag_now" ] || say "  FLUXER_IMAGE_TAG:   $tag_now -> $tag_old (in fluxer-ha/.env.shared)"
-	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example tunnel.compose.yml external-object-store.compose.yml; do
+	for f in $STACK_FILES; do
 		[ -s "$files/$f" ] && ! cmp -s "$files/$f" "$f" && say "  file:               $f"
 	done
 	[ ! -f "$files/ha.images.lock.yml" ] || cmp -s "$files/ha.images.lock.yml" fluxer-ha/ha.images.lock.yml || say "  file:               fluxer-ha/ha.images.lock.yml"
+	[ ! -f "$files/release" ] || cmp -s "$files/release" fluxer-ha/release || say "  release:            $(cat fluxer-ha/release 2>/dev/null || echo '?') -> $(cat "$files/release")"
 	n=0
 	while read -r ref id dig; do
 		case $ref in *@*) continue ;; esac
@@ -1122,10 +1367,11 @@ cmd_rollback() {
 		fi
 		docker image tag "$id" "$ref" || die "re-tagging $ref failed"
 	done <"$now/plan"
-	for f in docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example tunnel.compose.yml external-object-store.compose.yml; do
+	for f in $STACK_FILES; do
 		[ -s "$files/$f" ] && ! cmp -s "$files/$f" "$f" && install -m 644 "$files/$f" "$f"
 	done
 	[ ! -f "$files/ha.images.lock.yml" ] || install -m 644 "$files/ha.images.lock.yml" fluxer-ha/ha.images.lock.yml
+	[ ! -f "$files/release" ] || install -m 644 "$files/release" fluxer-ha/release
 	if [ -n "$tag_old" ] && [ "$tag_old" != "$tag_now" ]; then
 		sed -i "s/^FLUXER_IMAGE_TAG=.*/FLUXER_IMAGE_TAG=$tag_old/" fluxer-ha/.env.shared
 	fi

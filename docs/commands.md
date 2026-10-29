@@ -10,7 +10,7 @@ Run it as the account that installed Fluxer (in the `docker` group). Steps that 
 
 | Option | What it does |
 |---|---|
-| `--dir <fluxer dir>` | The Fluxer directory (the one upstream's `install.sh` created, with `docker-compose.yml`). Give it **before** the command. Without it: the directory recorded by `install` in `/etc/fluxer-ha/fluxer-ha.conf`, else the current directory. On the witness the default is `~/fluxer-witness`. |
+| `--dir <fluxer dir>` | The Fluxer directory (with `docker-compose.yml`, as `rexctl eject` leaves it). Give it **before** the command. Without it: the directory recorded by `install` in `/etc/fluxer-ha/fluxer-ha.conf`, else the current directory. On the witness the default is `~/fluxer-witness`. |
 | `--allow-root` | Permits running as root, like upstream's flag of the same name; it may come anywhere on the line. The services then run as root too. Without it, `fluxer-ha` refuses root. |
 | `-h`, `--help`, `help` | Prints the usage text. |
 
@@ -29,7 +29,7 @@ In the order [install.md](install.md) runs them.
 | `etcd-up` | site 2 | Starts site 2's etcd member. Needed before `migrate`. | — |
 | `migrate` | site 1 | Moves the running database under Patroni, in one short maintenance window. Rolls back by itself if anything fails before the restore checks out. | — |
 | `join` | site 2 | Clones the database from site 1, waits until site 2 is the sync standby, starts the warm tier and enables the timers. | — |
-| `leave [--yes] [--replace-old-volume]` | the spare, then the site you keep, then the witness | Back to a single site, keeping every write ([operations.md](operations.md#leaving-ha-back-to-a-single-site)). | `--yes` skips typing `leave`. `--replace-old-volume` lets it replace a leftover pre-HA `postgres-data` volume instead of refusing. |
+| `leave [--yes] [--replace-old-volume]` | the spare, then the site you keep, then the witness | Back to a single site, keeping every write, in a layout `rexctl takeover` accepts ([operations.md](operations.md#leaving-ha-back-to-a-single-site)). | `--yes` skips typing `leave`. `--replace-old-volume` lets it replace a leftover pre-HA `postgres-data` volume instead of refusing. |
 
 ### `init`
 
@@ -53,8 +53,8 @@ In the order [install.md](install.md) runs them.
 | `release` | the preferred site | Allows failback again, and clears its back-off | — |
 | `rollout [--dry-run]` | **the spare only** | Applies configuration and image changes to this site's containers, one service at a time, ending with a full media sync ([operations.md](operations.md#upgrades)) | `--dry-run` shows what it would recreate |
 | `pin [--pull]` | one site | Writes the image lock, `fluxer-ha/ha.images.lock.yml`, from the digests this site has ([operations.md](operations.md#image-versions-and-pinning)) | `--pull` pulls what the tags point at now first |
-| `upgrade-fetch --ref <ref>\|--from <dir> [--tag <tag>]` | both sites | Fetches upstream's stack files at `<ref>` and shows what changed. It keeps the old files, tag, lock and image list in `fluxer-ha/upgrade/<time>/` for `rollback`, and refuses a Postgres major-version change. Nothing restarts. | `--ref` the git ref (`main` for `v1`). `--from <dir>` takes the files from a local directory instead of downloading. `--tag` also sets `FLUXER_IMAGE_TAG` in `.env.shared`. |
-| `rollback [--files <dir>] [--yes]` | each site | Undoes an upgrade on this site: the files, the tag and the images, from the newest record ([operations.md](operations.md#undoing-an-upgrade)). Nothing restarts; then roll out as for any change. | `--files` names the record (a `fluxer-ha/upgrade/<time>` or `backups/record-<time>` directory). `--yes` skips typing `rollback`. |
+| `upgrade-fetch --release <version>\|latest\|--from <bundle> [--mint-keys\|--keys <file>] [--on-primary]` | the spare, then the other site once it's the spare | Fetches a release's stack files (its compose bundle), checks every Fluxer image digest in them against the release's published list, and shows what changed. It adds the settings the release needs to `.env.shared` and records the release in `fluxer-ha/release`. It keeps the old files, release, lock and image list in `fluxer-ha/upgrade/<time>/` for `rollback`, and refuses a Postgres major-version change and releases before 2026.1028. Refuses on the primary. Nothing restarts ([operations.md](operations.md#upgrading-fluxer)). | `--release` a version such as `2026.1028.192211`, or `latest` (what `fluxer.dev/compose/latest` points at; it prints the version for the other site). `--from` a bundle file (checked against the `fluxer-release-<version>.json` next to it) or an unpacked directory, instead of downloading. `--mint-keys` generates a new secret the release needs (the first site), `--keys` takes it from the file that wrote (the other). `--on-primary` overrides the refusal. |
+| `rollback [--files <dir>] [--yes]` | each site | Undoes an upgrade on this site: the files, the release and the images, from the newest record (never back to a release before 2026.1028) ([operations.md](operations.md#undoing-an-upgrade)). Nothing restarts; then roll out as for any change. | `--files` names the record (a `fluxer-ha/upgrade/<time>` directory). `--yes` skips typing `rollback`. |
 | `version` | any | Prints the version | — |
 
 ## Scripts in `fluxer-ha/`

@@ -29,6 +29,21 @@ KV_TABLE=$(envget FLUXER_POSTGRES_KV_TABLE); KV_TABLE=${KV_TABLE:-fluxer_kv}
 PGDB=$(envget FLUXER_POSTGRES_DATABASE); PGDB=${PGDB:-fluxer}
 
 dc() { docker compose --profile app "$@"; }
+# The tiers follow the configuration (tiers.sh), which an upgrade changes
+# under the running controller: reload them when the files they come from
+# change. Checked with the warm tier, every WARM_EVERY seconds.
+tiers_sum() { cat .env docker-compose.yml $(envget COMPOSE_FILE | tr ':' ' ') 2>/dev/null | cksum; }
+TIERS_SUM=$(tiers_sum)
+tiers_reload() {
+	s=$(tiers_sum)
+	[ "$s" != "$TIERS_SUM" ] || return 0
+	if tiers_load; then
+		TIERS_SUM=$s
+		log "configuration changed: tiers reloaded (cold: $COLD)"
+	else
+		log "configuration changed but doesn't parse: keeping the tiers as they were"
+	fi
+}
 # Your hooks (docs/operations.md, "Hooks"). Each gets 60 s: the loop that
 # stops the app tier on a demotion waits for it, so a hook that hangs mustn't
 # hold that up.
@@ -129,6 +144,11 @@ stop_cold() {
 	stop_services 5 edge
 	# shellcheck disable=SC2086
 	stop_services 10 $COLD
+	# And whatever an upgrade left behind that the configuration no longer
+	# defines (the old -shard services): fail-closed. rollout removes them.
+	o=$(tiers_orphans | tr '\n' ' ')
+	# shellcheck disable=SC2086
+	[ -z "$o" ] || { log "stopping containers the configuration no longer defines: $o"; stop_services 10 $o; }
 	gateway_restart "this site was demoted"
 	gw_clean=1
 	hook on-replica
@@ -148,6 +168,7 @@ log "starting"
 while true; do
 	now=$(date +%s)
 	if [ $((now - last_warm)) -ge $WARM_EVERY ]; then
+		tiers_reload
 		# shellcheck disable=SC2086
 		dc up -d --no-deps --no-recreate $WARM >/dev/null 2>&1 || log "warm tier check failed"
 		last_warm=$now

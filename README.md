@@ -4,7 +4,7 @@
 
 Two-site, automatic failover for a self-hosted [Fluxer](https://github.com/fluxerapp/fluxer) instance that runs on Docker Compose. It's built as a layer on top of an existing install: upstream's files stay as they are, and the HA parts (overlays, scripts, settings, state) live in one subdirectory, `fluxer-ha/`, of your Fluxer directory (wherever that is). Keep this repository's checkout somewhere else, such as `~/fluxer-ha`. The only upstream file it changes is `.env`, which it generates.
 
-**Status: 0.1, tested in a lab, not yet in production.** Every number below comes from a disposable three-VM lab ([docs/lab-results.md](docs/lab-results.md)). Read [Limits](#limits) before relying on it.
+**Status: 0.2** Every number below comes from a disposable three-VM lab ([docs/lab-results.md](docs/lab-results.md)). Read [Limits](#limits) before relying on it.
 
 ## What you get
 
@@ -32,7 +32,7 @@ Patroni (with etcd) decides which site is primary. A small controller on each si
 
 ## Requirements
 
-- An existing Fluxer install from upstream's `install.sh`: Docker Compose, with the bundled Postgres, Valkey and SeaweedFS. Either TLS mode works: the bundled edge (default) or your own reverse proxy.
+- An existing Fluxer install on Docker Compose, on **release 2026.1028 or later**, with the bundled Postgres, Valkey and SeaweedFS: from **rexctl followed by `rexctl eject`** (upstream's installer from that release on). An older install moves there first: `rexctl takeover`, `rexctl upgrade`, `rexctl eject`. Either TLS mode works: the bundled edge (default) or your own reverse proxy.
 - **Run it as the account that installed Fluxer** (in the `docker` group), like upstream's installer, with `sudo` available. `fluxer-ha` refuses to run as root unless you pass `--allow-root`. Its few root steps (systemd units, the firewall, the watchdog device) go through `sudo` and are printed first; the services run as your account. [docs/security.md](docs/security.md#what-runs-as-root) has the full list.
 - Two Linux hosts for the sites with systemd, Docker, Compose 2.24.4 or newer and Docker's iptables firewall backend. Tested on Debian 13 with Docker 29.9 and Compose 5.6, and only there.
 - A **third** small VM at a **third** location for the witness. Without the third location, a single network fault can take both of the others offline together.
@@ -71,14 +71,14 @@ Then run the drills in [docs/testing.md](docs/testing.md) before you trust it.
 | See what's going on | `fluxer-ha status` | [operations](docs/operations.md) |
 | Planned switchover | `fluxer-ha switchover` | |
 | Keep the primary where it is | `fluxer-ha hold` / `release` (on the preferred site) | |
-| Upgrade Fluxer | `fluxer-ha upgrade-fetch` and a pull on both, then `rollout` on the spare, `switchover`, `rollout` on the other | [operations, "Upgrades"](docs/operations.md#upgrades) |
+| Upgrade Fluxer | On the spare: `fluxer-ha upgrade-fetch --release <version>`, a pull, `rollout`; `switchover`; then the same on the other site | [operations, "Upgrades"](docs/operations.md#upgrades) |
 | Undo an upgrade | `fluxer-ha rollback` on both, then the same rollout | [operations, "Undoing an upgrade"](docs/operations.md#undoing-an-upgrade) |
 | Change a setting | edit `fluxer-ha/.env.shared` on both, `build-env.sh`, then the same rollout | [operations, "Changing a setting"](docs/operations.md#changing-a-setting) |
 | Pin every image by digest (optional, recommended) | `fluxer-ha pin`, copy the lock, add it to `COMPOSE_FILE` | [operations, "Image versions and pinning"](docs/operations.md#image-versions-and-pinning) |
 | Every command and option | `fluxer-ha help` | [commands](docs/commands.md) |
 | Upgrade fluxer-ha itself | `git pull`, then the checkout's `fluxer-ha install site` on each site and `install witness` | [operations, "Upgrading fluxer-ha itself"](docs/operations.md#upgrading-fluxer-ha-itself) |
 
-Upstream's `install.sh --update` is safe on the **spare**, and gives you its backup and refreshed stack files. It can't upgrade Fluxer itself under HA, though, so `rollout` still does that part ([operations](docs/operations.md#upgrades)). **Never run it on the primary**: it stops that site's Postgres for its backup. Its `--rollback` doesn't work on an HA site: it stops part-way. Use `fluxer-ha rollback`, which reads install.sh's records ([operations](docs/operations.md#upgrades)).
+**rexctl,** upstream's installer from release 2026.1028 on, and fluxer-ha take turns. Install with rexctl, then **`rexctl eject`** hands the instance to plain Docker Compose and fluxer-ha builds on that. While HA is on, rexctl's admin commands (`users`, `admins`, `invites`, `registration`, ...) keep working on site 1 when it's the primary. Its commands that run the stack refuse an ejected instance, and its takeover refuses fluxer-ha's overlays. `fluxer-ha leave` leaves an instance that **`rexctl takeover`** accepts ([operations, "rexctl"](docs/operations.md#rexctl-on-an-ha-site)).
 
 ## Limits
 

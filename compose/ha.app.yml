@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# fluxer-ha: the application tier's part of the two-site overlay, for stack
+# files from release 2026.1028 on (one snowflakes service, no -shard
+# services; fluxer-ha refuses older ones). `fluxer-ha install` copies it into
+# fluxer-ha/ with the data tier's part, ha.compose.yml.
+
+x-warm: &warm
+  # Runs on BOTH sites: no database writes at startup, no inbound traffic.
+  # The controller keeps these up.
+  profiles: [app]
+
+x-cold: &cold
+  # Runs on the PRIMARY only. The controller starts and stops these.
+  # restart "no" stops Docker from bringing them back on a host that has
+  # rebooted as a replica.
+  profiles: [app]
+  restart: "no"
+
+services:
+  # --- Application tier ------------------------------------------------------
+  gateway: *warm
+  media-proxy: *warm
+  static-proxy: *warm
+  # Per-site snowflake worker ID (docs/architecture.md, "Snowflake IDs").
+  # Releases from 2026.1028 on run one snowflakes service, in one of three
+  # modes (fluxer_snowflakes, FLUXER_SVC_MODE): router, shard or combined.
+  # Site 1 keeps the stock "combined" (shard 0 of 1, worker ID 0), which also
+  # answers the router subject svc.snowflakes. Site 2 runs "shard", shard 1
+  # of 2, which makes its worker ID 1 (the shard ID is the worker ID), and
+  # its API and worker request IDs from that shard directly
+  # (FLUXER_SNOWFLAKE_SERVICE_SUBJECT, below). init writes these per site.
+  snowflakes:
+    <<: *warm
+    environment:
+      FLUXER_SVC_MODE: ${FLUXER_HA_SNOWFLAKE_MODE:-combined}
+      FLUXER_SVC_SHARD_ID: ${FLUXER_HA_SNOWFLAKE_WORKER_ID:-0}
+      FLUXER_SVC_SHARD_COUNT: ${FLUXER_HA_SNOWFLAKE_SHARD_COUNT:-1}
+  gifs: *warm
+  unfurl: *warm
+
+  # The API, worker, users and messages run schema DDL at startup
+  # (PostgresKvQueryExecutor.ts:856-937, fluxer_svc/src/postgres.rs:96), so
+  # they can only start against a primary.
+  api:
+    <<: *cold
+    environment:
+      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
+  worker:
+    <<: *cold
+    environment:
+      FLUXER_SNOWFLAKE_SERVICE_SUBJECT: ${FLUXER_HA_SNOWFLAKE_SUBJECT:-svc.snowflakes}
+  users: *cold
+  messages: *cold
+  push: *cold
+  app-proxy: *cold
+  admin: *cold
+  livekit: *cold
+  # The edge: with bundled TLS it binds 80/443 and gets the certificate; behind
+  # your own proxy it serves plain HTTP for it (docker-compose.proxy.yml).
+  # Because it's cold, a non-primary site serves nothing for the Fluxer domain:
+  # nothing listens (bundled), or your proxy has no upstream (it should then
+  # close the connection: docs/reverse-proxies.md). That's the traffic-side
+  # fence. A proxy must forward ONLY to the edge, never straight to gateway or
+  # media-proxy, which run on both sites.
+  edge: *cold

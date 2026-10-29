@@ -1,6 +1,6 @@
 # Installing fluxer-ha
 
-This takes an existing single-site Fluxer install and turns it into a two-site pair with a witness. Your instance keeps running until `migrate`, which needs one short maintenance window: 56–92 s in the lab with a 227 MB database. The time grows with the size of the database dump.
+This takes an existing single-site Fluxer install and turns it into a two-site pair with a witness. Your instance keeps running until `migrate`, which needs one short maintenance window: 56–92 s in the lab with a 227 MB database, 63 s with messages being sent throughout. The time grows with the size of the database dump.
 
 **The order, at a glance.** Each step says on which host it runs.
 
@@ -32,14 +32,17 @@ Read [architecture.md](architecture.md) first, so the steps make sense.
 ├── .env                      rebuilt by fluxer-ha/build-env.sh; don't edit it
 ├── docker-compose.yml        upstream's stack files, untouched
 ├── docker-compose.proxy.yml    (with --tls proxy)
-├── Caddyfile, .env.example, ...
-├── backups/                  upstream install.sh --update's records, if you run it
+├── Caddyfile, .env.example, caddy.d/, certs/, ...
+├── .rexctl/                  rexctl's record, if you installed with rexctl (ejected; fluxer-ha never touches it)
+├── backups/                  rexctl's backups
 └── fluxer-ha/
     ├── .env.shared           settings both sites share (byte-identical)
     ├── .env.site             this site's own settings
     ├── .env.built            what build-env.sh last wrote, so it can tell edits apart
-    ├── ha.compose.yml        the HA overlay, named in COMPOSE_FILE
+    ├── ha.compose.yml        the HA overlay's data tier, named in COMPOSE_FILE
+    ├── ha.app.yml            its application tier, the version that matches the stack files
     ├── ha.proxy-network.yml  (with --proxy-network)
+    ├── release               the release the stack files come from (upgrade-fetch keeps it)
     ├── *.sh, dns/, patroni/, tests/   the scripts the services run
     ├── hooks/                yours: on-primary, an exec DNS hook (install never overwrites it)
     ├── init/                 init's output: site 2's files and the bundle (site 1)
@@ -63,7 +66,7 @@ Like upstream's `install.sh`, `fluxer-ha` refuses to run as root. Run every comm
 
 | Host | Role | Needs |
 |---|---|---|
-| **site 1** | Your current server. It becomes the first primary, and the **preferred** site that failback returns to. | Your running Fluxer, from upstream's `install.sh` |
+| **site 1** | Your current server. It becomes the first primary, and the **preferred** site that failback returns to. | Your running Fluxer on release 2026.1028 or later, installed with rexctl and then ejected (below) |
 | **site 2** | The warm spare. Same size as site 1: it runs everything after a failover. | Docker, Compose 2.24.4+, nothing of Fluxer's yet |
 | **witness** | One etcd member, the deciding vote. **At a third location.** | 1 vCPU, 1 GB RAM, Docker |
 
@@ -72,6 +75,16 @@ On all three: `docker`, the `docker compose` plugin, `curl`, `openssl`, `sudo`, 
 ```sh
 apt install wireguard jq bind9-dnsutils chrony iptables sudo openssh-client openssh-server
 ```
+
+**Installed with rexctl?** From release 2026.1028 on, upstream installs Fluxer with rexctl (`install.sh` downloads it). fluxer-ha needs the instance in plain Docker Compose hands, so on site 1, in the Fluxer directory, before step 3:
+
+```sh
+rexctl eject
+```
+
+It writes every setting into `.env` (with `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`), removes rexctl's boot unit and automatic upgrades, and keeps Fluxer running. rexctl's record stays in `.rexctl/`, marked ejected, so its admin commands (`users`, `admins`, `invites`, `registration`, ...) keep working on site 1 while it's the primary, and `fluxer-ha leave` followed by `rexctl takeover` gives the instance back to rexctl later ([operations.md](operations.md#rexctl-on-an-ha-site)). `doctor` and `init` refuse an instance rexctl still manages.
+
+**Installed with the older `install.sh`** (before release 2026.1028)? fluxer-ha 0.2 refuses that stack. Let rexctl adopt and upgrade it first, then eject: `rexctl takeover`, `rexctl upgrade`, `rexctl eject` (rexctl takes one compose file of your own, `custom.compose.yml`; combine any overlays of yours into it first). An HA pair on such a stack leaves HA first ([operations.md](operations.md#moving-a-pair-from-before-release-20261028)).
 
 **Check your install first.** fluxer-ha supports upstream's layout with the bundled Postgres, Valkey and SeaweedFS, and either TLS mode (`--tls bundled`, the default, or `--tls proxy`). It does **not** support `FLUXER_POSTGRES_URL`, an outside `FLUXER_KV_URL`, `external-object-store.compose.yml` or `tunnel.compose.yml`. `fluxer-ha doctor` checks this for you.
 
@@ -177,7 +190,7 @@ On the witness it checks less: the account, Docker and Compose, the tools and `w
 Run it from your Fluxer directory, or give that directory as `fluxer-ha --dir <dir> init …`: **`--dir` goes before the command**, never after it. Once `install` has run, fluxer-ha remembers the directory.
 
 ```sh
-cd ~/fluxer     # the directory install.sh created
+cd ~/fluxer     # your Fluxer directory
 ~/fluxer-ha/fluxer-ha init \
   --site1-wg 10.77.0.1 --site2-wg 10.77.0.2 --witness-wg 10.77.0.3 \
   --site1-ip <site 1 public IPv4> --site2-ip <site 2 public IPv4> \
@@ -325,19 +338,19 @@ site1$ fluxer-ha migrate
 
 1. **Before the window:**
    - checks everything again, including that the witness is reachable;
-   - builds the Patroni image and pulls the HA images.
+   - builds the Patroni image and pulls the HA images, if they aren't on the host yet.
 2. **The window starts:**
    - stops everything except Postgres;
-   - dumps the database to `~/fluxer/fluxer-ha/backups/` (upstream's `install.sh --update` keeps its records in `~/fluxer/backups/`).
+   - counts the rows, now that nothing writes, and dumps the database to `~/fluxer/fluxer-ha/backups/` (upstream's `install.sh --update` keeps its records in `~/fluxer/backups/`).
 3. **The cut-over:**
    - switches to the HA settings;
    - starts etcd and turns on its authentication;
    - turns on the firewall;
    - starts Patroni on a **new** volume;
-   - restores the dump and checks the row count.
+   - creates the database's extensions as Patroni's superuser (a database a release from 2026.1028 on set up has `pg_stat_statements`), restores the dump and checks the row count.
 4. **The window ends:** the warm tier is recreated with the HA settings, then the controller starts the rest of the app tier. The window closes once your instance answers on HTTPS.
 
-If anything fails before the restore checks out, `migrate` **rolls back by itself**: it restores your old `.env` and starts the old stack. Your old database volume (`fluxer_postgres-data`) is never touched; keep it, with the dump and `fluxer-ha/.env.pre-ha` (your single-site `.env`), until the drills pass.
+If anything fails before the restore checks out, `migrate` **rolls back by itself**: it restores your old `.env` and starts the old stack. Fix the cause and run `migrate` again. Your old database volume (`fluxer_postgres-data`) is never touched; keep it, with the dump and `fluxer-ha/.env.pre-ha` (your single-site `.env`), until the drills pass.
 
 ## 11. Join site 2
 

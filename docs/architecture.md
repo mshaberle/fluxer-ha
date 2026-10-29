@@ -17,12 +17,12 @@ Fluxer keeps its durable state in Postgres (a KV-style table, `fluxer_kv`). The 
 
 ## Tiers
 
-[lib/tiers.sh](../lib/tiers.sh) lists every service once:
+[lib/tiers.sh](../lib/tiers.sh) lists every service once. Each script keeps only the services the current configuration defines. The controller reloads them when the configuration changes, and stops any container of a service the configuration no longer defines when its site isn't primary; `rollout` removes those containers.
 
 | Tier | Services | Where it runs | Who starts it |
 |---|---|---|---|
-| **Cold** | edge, api, worker, push, users(-shard), messages(-shard), admin, app-proxy, livekit | the primary only | the controller, `restart: "no"` so a rebooted spare starts none of them |
-| **Warm** | gateway, media-proxy, static-proxy, snowflakes(-shard), gifs(-shard), unfurl(-shard) | both | Docker; the controller checks they're up, and restarts the gateway at role changes (below) |
+| **Cold** | edge, api, worker, push, users, messages, admin, app-proxy, livekit | the primary only | the controller, `restart: "no"` so a rebooted spare starts none of them |
+| **Warm** | gateway, media-proxy, static-proxy, snowflakes, gifs, unfurl | both | Docker; the controller checks they're up, and restarts the gateway at role changes (below) |
 | **Data** | etcd, postgres (Patroni), valkey, nats, meilisearch, seaweedfs, valkey-role-link, filer-sync, s3-mirror | both, always | Docker; never the controller |
 
 The **edge** is cold. On the spare nothing serves the Fluxer domain: either nothing listens (bundled TLS) or your proxy has no upstream and closes the connection ([reverse-proxies.md](reverse-proxies.md)). That's the traffic-side fence.
@@ -64,8 +64,8 @@ In the lab an isolated primary acknowledged **0** writes after the isolation, an
 ## Snowflake IDs
 
 Both sites run the snowflake service, and a site could start minting IDs within a millisecond of the other's last one. To keep IDs unique, the sites use **different worker IDs**:
-- **Site 1** keeps worker 0, the stock value.
-- **Site 2** runs its shard as shard 1 of 2. The shard ID is passed as the worker ID ([main.rs:37](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_snowflakes/src/main.rs#L37), [shard_impl.rs:15](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_snowflakes/src/shard_impl.rs#L15)). Site 2's API and worker ask that shard directly (`FLUXER_SNOWFLAKE_SERVICE_SUBJECT`, [ServiceRegistry.ts:42](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_api/src/api/middleware/ServiceRegistry.ts#L42)).
+- **Site 1** keeps worker 0, the stock value. That's the `combined` mode of the snowflakes service (shard 0 of 1, which also answers the router subject).
+- **Site 2** runs its shard as shard 1 of 2: snowflakes in `shard` mode (`FLUXER_HA_SNOWFLAKE_MODE=shard` in its `.env.site`). Lab, 2026-10-29, release 2026.1028.192211: every ID site 2 minted carried worker 1, every one site 1 minted worker 0. The shard ID is passed as the worker ID ([main.rs:37](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_snowflakes/src/main.rs#L37), [shard_impl.rs:15](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_snowflakes/src/shard_impl.rs#L15)). Site 2's API and worker ask that shard directly (`FLUXER_SNOWFLAKE_SERVICE_SUBJECT`, [ServiceRegistry.ts:42](https://github.com/fluxerapp/fluxer/blob/c0f825ae2aa3e1508a5b58df8a239b16e7d7a4cd/fluxer_api/src/api/middleware/ServiceRegistry.ts#L42)).
 
 The controller also holds the app tier at promotion until both of these hold:
 - chrony's offset is under 100 ms;

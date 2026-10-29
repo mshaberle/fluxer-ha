@@ -9,7 +9,7 @@
 # skips the restart policy (lab, Docker 29.9: a `docker kill`ed container stayed
 # exited until something else started it). Expected recovery:
 #   warm services: Docker restarts them (restart: unless-stopped, compose line 206)
-#   cold services: controller.sh restarts them within ~2 s (restart: "no", 05-deploy/ha.compose.yml)
+#   cold services: controller.sh restarts them within ~2 s (restart: "no", compose/ha.app.yml)
 # Data-tier services (postgres, etcd, valkey, seaweedfs, nats, meilisearch) are
 # refused here. Those are node-level scenarios.
 . "$(dirname "$0")/gd-lib.sh"
@@ -17,7 +17,7 @@
 [ "$(id -u)" = 0 ] || die "this drill signals a container's process from the host: run it with sudo"
 SVC=${1:-}
 case "$SVC" in
-	api|worker|gateway|edge|push|app-proxy|admin|media-proxy|static-proxy|users|users-shard|messages|messages-shard|snowflakes|snowflakes-shard|gifs|gifs-shard|unfurl|unfurl-shard|livekit) ;;
+	api|worker|gateway|edge|push|app-proxy|admin|media-proxy|static-proxy|users|messages|snowflakes|gifs|unfurl|livekit) ;;
 	*) die "service must be an application service (see the header)";;
 esac
 is_primary || die "run this on the current PRIMARY"
