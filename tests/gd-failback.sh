@@ -41,8 +41,12 @@ wait_for 600 "failback.sh started the stability clock" since_ok
 wait_for $(( ${window:-$STABLE} + JOBS_WAIT + 300 )) "$SELF is the primary again (automatic failback)" is_primary
 FAILBACK_AT=$(date -u -d "@$(sget last_failback)" +%Y-%m-%dT%H:%M:%SZ)
 echo "FAILBACK_AT=$FAILBACK_AT"
-dns_ok() { [ "$(dig +short A "$DNS_NAME" @1.1.1.1 | tail -n 1)" = "$SELF_PUBLIC" ]; }
-wait_for 180 "public DNS (1.1.1.1) -> $SELF_PUBLIC" dns_ok
+# With FLUXER_HA_DNS_PROVIDER=none (a floating IP or a load balancer), public
+# DNS doesn't follow the primary, so there's nothing to wait for (lab, 2026-10-30).
+RESOLVER=$(envget FLUXER_HA_DNS_CHECK_RESOLVER); RESOLVER=${RESOLVER:-1.1.1.1}
+dns_ok() { [ "$(dig +short A "$DNS_NAME" @"$RESOLVER" | tail -n 1)" = "$SELF_PUBLIC" ]; }
+if [ "$(envget FLUXER_HA_DNS_PROVIDER)" = none ]; then log "DNS provider none: not waiting for public DNS"
+else wait_for 180 "public DNS ($RESOLVER) -> $SELF_PUBLIC" dns_ok; fi
 wait_for 180 "https://$TLS_NAME/api/_health OK via $SELF_PUBLIC" https_ok "$SELF_PUBLIC"
 wait_for 300 "peer $PEER rejoined as the synchronous standby" peer_is_sync
 journalctl -u fluxer-ha-failback --since "@$(( $(sget last_failback) - 60 ))" --no-pager | tail -n 20

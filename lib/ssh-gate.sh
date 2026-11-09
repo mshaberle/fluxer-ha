@@ -12,7 +12,8 @@
 # key, so it can't be spoofed inside the mesh). The requested command arrives
 # in SSH_ORIGINAL_COMMAND and must be exactly one of these verbs:
 #
-#   env-hash       sha256 of fluxer-ha/.env.shared + fluxer-ha/ha.images.lock.yml (drift check).
+#   env-hash       sha256 of fluxer-ha/.env.shared + fluxer-ha/ha.images.lock.yml +
+#                  docker-compose.yml (drift check, the release included).
 #                  Integrity only: a compromised peer can lie.
 #   cert-receive   a tar of the Fluxer certificate on stdin, installed into
 #                  this site's certificate storage. Refused on the primary.
@@ -60,7 +61,7 @@ PROJECT=$(envget COMPOSE_PROJECT_NAME); PROJECT=${PROJECT:-fluxer}
 
 case "${1:-}" in
 	env-hash)
-		cat fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml 2>/dev/null | sha256sum | cut -d' ' -f1
+		cat fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml docker-compose.yml 2>/dev/null | sha256sum | cut -d' ' -f1
 		;;
 	cert-receive)
 		# Where the certificate lives (FLUXER_HA_CERT_MODE):

@@ -378,9 +378,10 @@ cmd_bundle() {
 		[ -f "$f" ] || die "COMPOSE_FILE names $f, which isn't in $DIR"
 		cp -p "$f" "$tmp/"
 	done
-	# The edge mounts these (releases from 2026.1028 on), with your own Caddy
-	# snippets and certificates if you added any.
-	for d in caddy.d certs; do [ ! -d "$d" ] || cp -Rp "$d" "$tmp/"; done
+	# The edge mounts caddy.d and certs (releases from 2026.1028 on), the api
+	# and worker ca (from 2026.1109 on), with your own Caddy snippets and
+	# certificates if you added any.
+	for d in caddy.d certs ca; do [ ! -d "$d" ] || cp -Rp "$d" "$tmp/"; done
 	for f in fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml fluxer-ha/release; do [ ! -f "$f" ] || cp -p "$f" "$tmp/fluxer-ha/"; done
 	cp "$out/site2.env.site" "$tmp/fluxer-ha/.env.site"
 	tar -C "$tmp" -czf "$out/site2-bundle.tar.gz" .
@@ -1101,7 +1102,7 @@ cmd_pin() { preflight; resolve_dir; exec ./fluxer-ha/pin-images.sh "$@"; }
 # It never restarts anything: `fluxer-ha rollout` on the spare does that.
 #
 # The files of this kind, kept in the record for `rollback`:
-STACK_FILES="docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example ipv6.compose.yml tunnel.compose.yml external-object-store.compose.yml"
+STACK_FILES="docker-compose.yml docker-compose.proxy.yml Caddyfile .env.example ipv6.compose.yml tunnel.compose.yml external-object-store.compose.yml external-voice.compose.yml"
 # Secrets a release can add, generated as rexctl does (fluxer_rexctl,
 # internal/secrets). The ones that guard stored data never are: they exist
 # already, and a new value would lock the data out.
@@ -1140,7 +1141,8 @@ cmd_upgrade_fetch() {
 		[ -n "$rel" ] || die "couldn't work out which release https://fluxer.dev/compose/latest points to: pass --release <version>"
 		say "latest is release $rel: pass --release $rel on the other site"
 	fi
-	[ -z "$rel" ] || say "$rel" | grep -Eqx '[0-9]{4}\.[0-9]{4}\.[0-9]{6}' || die "--release takes a version like 2026.1028.192211"
+	# Upstream drops leading zeros: 2026.1109.45135 was built at 04:51:35.
+	[ -z "$rel" ] || say "$rel" | grep -Eqx '[0-9]{4}\.[0-9]{3,4}\.[0-9]{1,6}' || die "--release takes a version like 2026.1028.192211"
 	[ "$mintkeys" = 0 ] || [ -z "$keysf" ] || die "--mint-keys on the first site, --keys <file> on the other: not both"
 	[ -z "$keysf" ] || [ -r "$keysf" ] || die "can't read $keysf"
 	# The spare first. On the primary, the controller starts any app container
@@ -1268,8 +1270,9 @@ the other site and pass it there with --keys <file>."
 		if cmp -s "$f" "$new/$f"; then say "  $f unchanged"
 		else say "  $f $([ -f "$f" ] && echo CHANGED || echo new)"; [ ! -f "$f" ] || cp -p "$f" "$keep/"; install -m 644 "$new/$f" "$f"; fi
 	done
-	# The edge mounts these; your own snippets and certificates in them stay.
-	for d in caddy.d certs; do
+	# The edge mounts caddy.d and certs, the api and worker ca (from 2026.1109
+	# on); your own snippets and certificates in them stay.
+	for d in caddy.d certs ca; do
 		[ -d "$new/$d" ] || continue
 		[ -d "$d" ] || { mkdir -p "$d" && chmod 755 "$d" && say "  $d/ new"; }
 		for f in "$new/$d"/*; do [ ! -f "$f" ] || [ -e "$d/$(basename "$f")" ] || install -m 644 "$f" "$d/"; done
@@ -1285,7 +1288,7 @@ the other site and pass it there with --keys <file>."
 	say "  2. fluxer-ha rollout                                       (here, the spare)"
 	say "  3. if the other site hasn't fetched release ${rel:-<this one>} yet: fluxer-ha switchover, then there,"
 	say "     as the spare: upgrade-fetch --release ${rel:-<the same>}$([ -z "$need" ] || [ -n "$keysf" ] || echo ' --keys <new-keys.env>'), the pull, rollout"
-	say "Until both sites have it, their health checks report that fluxer-ha/.env.shared differs."
+	say "Until both sites have it, their health checks report that docker-compose.yml differs, and failback waits."
 	[ -z "$rel" ] || say "rexctl $rel matches these files: use that version for its admin commands, and for rexctl takeover after fluxer-ha leave."
 	say "To undo before the switchover: fluxer-ha rollback (docs/operations.md, 'Undoing an upgrade')."
 }

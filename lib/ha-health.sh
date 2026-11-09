@@ -123,12 +123,16 @@ systemctl is-active --quiet fluxer-ha-controller || fail "controller not running
 offset=$(chronyc tracking 2>/dev/null | awk '/^System time/ {print $4}')
 [ -n "$offset" ] && awk -v o="$offset" 'BEGIN { exit !(o < 0.1) }' || fail "clock offset ${offset:-unknown}"
 if [ -n "$PEER_SSH" ]; then
-	# The shared settings and the image lock (fluxer-ha/pin-images.sh) must match.
-	# Same computation as ssh-gate.sh env-hash.
-	here=$(cat fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml 2>/dev/null | sha256sum | cut -d' ' -f1)
+	# The shared settings, the image lock (fluxer-ha/pin-images.sh) and the
+	# release's docker-compose.yml, which pins every Fluxer image by digest,
+	# must match. A release that adds no setting leaves .env.shared alone, so
+	# without docker-compose.yml a spare on the new release and a primary on
+	# the old one would look the same, and failback could move the primary
+	# onto the old release (lab F72). Same computation as ssh-gate.sh env-hash.
+	here=$(cat fluxer-ha/.env.shared fluxer-ha/ha.images.lock.yml docker-compose.yml 2>/dev/null | sha256sum | cut -d' ' -f1)
 	# The peer's forced command (ssh-gate.sh) only answers fixed verbs.
 	there=$(ssh_peer "$PEER_SSH" env-hash)
-	[ "$here" = "$there" ] || fail "fluxer-ha/.env.shared or fluxer-ha/ha.images.lock.yml differs between sites (they must be byte-identical; compare sha256sum on both)"
+	[ "$here" = "$there" ] || fail "fluxer-ha/.env.shared, fluxer-ha/ha.images.lock.yml or docker-compose.yml differs between sites (they must be byte-identical; after an upgrade-fetch, until the other site has the same release)"
 fi
 
 # 5b. Nothing edited the generated .env directly. Upstream's install.sh --update
